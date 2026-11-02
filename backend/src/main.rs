@@ -35,6 +35,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(handlers::root))
         .route("/healthz", get(handlers::healthz))
+        .route("/health", get(handlers::healthz))
         .route("/manus-routes.json", get(handlers::routes_manifest))
         .route("/login", get(handlers::login_page).post(handlers::login))
         .route("/logout", post(handlers::logout))
