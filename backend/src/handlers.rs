@@ -1090,10 +1090,11 @@ async fn record_spam(
 
 pub async fn security_headers(request: Request<axum::body::Body>, next: Next) -> Response {
     let is_admin_page = request.uri().path() == "/admin";
+    let is_login_page = request.uri().path() == "/login";
     let mut response = next.run(request).await;
     let is_404_page = response.status() == StatusCode::NOT_FOUND;
     let headers = response.headers_mut();
-    let csp = if is_admin_page || is_404_page {
+    let csp = if is_admin_page || is_login_page || is_404_page {
         "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'"
     } else {
         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'"

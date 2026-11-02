@@ -1,5 +1,5 @@
 const form = document.getElementById('loginForm');
-const email = document.getElementById('email');
+const username = document.getElementById('username');
 const pass = document.getElementById('password');
 const eye = document.getElementById('eye');
 const error = document.getElementById('loginError');
@@ -30,7 +30,7 @@ form.addEventListener('submit', async (event) => {
       method: 'POST',
       credentials: 'include',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ username: email.value.trim(), password: pass.value })
+      body: JSON.stringify({ username: username.value.trim(), password: pass.value })
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || 'Unable to sign in');
