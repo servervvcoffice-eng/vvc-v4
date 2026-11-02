@@ -49,6 +49,7 @@ async fn main() {
         .route("/assets/about.js", get(handlers::about_js))
         .route("/assets/admin.css", get(handlers::admin_css))
         .route("/assets/admin.js", get(handlers::admin_js))
+        .route("/assets/admin/*path", get(handlers::admin_file))
         .route("/api/me", get(handlers::me))
         .route("/api/admin/stats", get(handlers::admin_stats))
         .route("/api/admin/activity", get(handlers::admin_activity))

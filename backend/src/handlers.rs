@@ -3,12 +3,14 @@ use crate::{
     store::{self, AppState, AuditLog, FailedLogin, Role, User, ViewLog},
 };
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     middleware::Next,
     response::{Html, IntoResponse, Redirect, Response},
     Json,
 };
+use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
@@ -23,8 +25,9 @@ const ABOUT_HTML: &str = include_str!("../project/about/index.html");
 const ABOUT_CSS: &str = include_str!("../project/about/style.css");
 const ABOUT_JS: &str = include_str!("../project/about/app.js");
 const ADMIN_HTML: &str = include_str!("../project/admin/index.html");
-const ADMIN_CSS: &str = include_str!("../project/admin/style.css");
-const ADMIN_JS: &str = include_str!("../project/admin/app.js");
+const ADMIN_CSS: &str = "";
+const ADMIN_JS: &str = "";
+static ADMIN_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/project/admin");
 
 #[derive(Clone)]
 struct AuthContext {
@@ -341,6 +344,47 @@ pub async fn admin_js(State(state): State<AppState>, headers: HeaderMap) -> Resp
         ADMIN_JS,
     )
     .await
+}
+pub async fn admin_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Response {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains("..")
+        || path.contains('\\')
+        || path.chars().any(|c| c.is_control())
+    {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let Some(file) = ADMIN_DIR.get_file(&path) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let Some(ctx) = auth_context(&state, &headers).await else {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    };
+    if !has_permission(&ctx.user, "admin.dashboard.read") {
+        return safe_forbidden_page();
+    }
+    let content_type = match file.path().extension().and_then(|x| x.to_str()) {
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .body(Body::from(file.contents().to_vec()))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response())
 }
 
 async fn protected_page(
@@ -907,9 +951,15 @@ pub async fn gateway_guard(
 }
 
 pub async fn security_headers(request: Request<axum::body::Body>, next: Next) -> Response {
+    let is_admin_page = request.uri().path() == "/admin";
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert("content-security-policy", HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'"));
+    let csp = if is_admin_page {
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'"
+    } else {
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'"
+    };
+    headers.insert("content-security-policy", HeaderValue::from_static(csp));
     headers.insert(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),

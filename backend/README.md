@@ -14,6 +14,10 @@ COOKIE_SECURE=false cargo run --manifest-path Cargo.toml
 
 Open `http://localhost:3000/login`. The development seed account is `superadmin`; its password is the value of `AEGIS_DEV_PASSWORD`. This process-local repository is intentional for a credential-free Preview and test run. It is not the durable production store.
 
+### Admin page assets
+
+The Admin Panel is self-contained: its reference-matched CSS and JavaScript are embedded in `project/admin/index.html`, so the page still renders and functions if `style.css` or `app.js` is absent. Those files remain optional source-of-truth files for editing and can use any filename. Additional files placed under `project/admin/` can be connected from the page and are served only to authenticated users with `admin.dashboard.read` through `/assets/admin/<safe-relative-path>`; traversal, control characters, and absolute paths are rejected.
+
 ## Production persistence and deployment
 
 Apply `migrations/001_init.sql` to a dedicated Supabase PostgreSQL project. Configure `DATABASE_URL` with a least-privilege application credential, keep the Supabase service-role credential only on the trusted backend, and never expose it to browser code. The production repository adapter should persist users, role assignments, sessions, operational logs, and audit/security events in PostgreSQL. Use Redis (`REDIS_URL`) for distributed login throttling and short-lived abuse state; Redis must not be the only durable audit or account store.
