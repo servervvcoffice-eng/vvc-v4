@@ -2,6 +2,8 @@
 
 AegisCore is a private, single-project workspace implemented as a Rust/Axum service. The public login page is available at `/login`; `/home`, `/about`, `/admin`, and all private assets are served only after server-side authentication and explicit permission checks. `backend/project/` is source data compiled into allowlisted handlers; it is not a static web root.
 
+Unknown paths such as `/unknown` and `/unknown/hello` return the supplied frosted-glass 404 page with a Home link. An authenticated account without `admin.dashboard.read` also receives that same 404 page for `/admin`, avoiding disclosure of the Admin route.
+
 ## Run locally
 
 Install Rust 1.78+ and run:

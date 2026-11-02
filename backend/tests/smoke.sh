@@ -4,6 +4,11 @@ BASE_URL="${BASE_URL:-http://127.0.0.1:3000}"
 COOKIE_JAR="$(mktemp)"
 trap 'rm -f "$COOKIE_JAR"' EXIT
 curl -fsS "$BASE_URL/healthz" | grep -qx ok
+for unknown_path in /unknown /unknown/hello; do
+  status="$(curl -sS -o /tmp/aegis-404-body -w '%{http_code}' "$BASE_URL$unknown_path")"
+  test "$status" = 404
+  grep -q 'Page Not Found' /tmp/aegis-404-body
+done
 curl -fsS -D /tmp/aegis-headers "$BASE_URL/home" -o /tmp/aegis-body
  grep -q 'location: /login' /tmp/aegis-headers
 curl -fsS -D /tmp/aegis-root-headers "$BASE_URL/" -o /tmp/aegis-root-body

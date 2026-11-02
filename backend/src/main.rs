@@ -89,6 +89,7 @@ async fn main() {
             "/api/admin/clear/failed/:range",
             delete(handlers::admin_clear_failed),
         )
+        .fallback(handlers::not_found)
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(config.max_body_bytes))
         .layer(middleware::from_fn_with_state(

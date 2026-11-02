@@ -27,6 +27,7 @@ const ABOUT_JS: &str = include_str!("../project/about/app.js");
 const ADMIN_HTML: &str = include_str!("../project/admin/index.html");
 const ADMIN_CSS: &str = "";
 const ADMIN_JS: &str = "";
+const NOT_FOUND_HTML: &str = include_str!("../public/404.html");
 static ADMIN_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/project/admin");
 
 #[derive(Clone)]
@@ -98,6 +99,14 @@ pub async fn healthz() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         "ok",
     )
+}
+pub async fn not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        NOT_FOUND_HTML,
+    )
+        .into_response()
 }
 pub async fn routes_manifest() -> impl IntoResponse {
     (
@@ -279,6 +288,11 @@ pub async fn about_page(State(state): State<AppState>, headers: HeaderMap) -> Re
     protected_page(&state, &headers, "about.read", ABOUT_HTML, "About").await
 }
 pub async fn admin_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(ctx) = auth_context(&state, &headers).await {
+        if !has_permission(&ctx.user, "admin.dashboard.read") {
+            return not_found().await;
+        }
+    }
     protected_page(
         &state,
         &headers,
