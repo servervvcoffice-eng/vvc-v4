@@ -860,6 +860,44 @@ pub async fn admin_failed_logins(
     paged_response(items, &query)
 }
 
+pub async fn admin_spam(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    if api_context(&state, &headers, Some("admin.spam.read"))
+        .await
+        .is_none()
+    {
+        return json_error(StatusCode::FORBIDDEN, "Permission required");
+    }
+    let db = state.pub_store.read().await;
+    let start = range_start(query.range.as_deref());
+    let search = query.search.as_deref().unwrap_or("").to_lowercase();
+    let items: Vec<_> = db
+        .spam
+        .iter()
+        .rev()
+        .filter(|item| start.map(|s| item.timestamp >= s).unwrap_or(true))
+        .filter(|item| {
+            search.is_empty()
+                || format!(
+                    "{} {} {} {} {} {}",
+                    item.username,
+                    item.ip,
+                    item.device_fingerprint,
+                    item.device_model,
+                    item.route,
+                    item.method
+                )
+                .to_lowercase()
+                .contains(&search)
+        })
+        .cloned()
+        .collect();
+    paged_response(items, &query)
+}
+
 pub async fn admin_audit_logs(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -904,6 +942,13 @@ pub async fn admin_clear_failed(
 ) -> Response {
     clear_operational(&state, &headers, &range, "failed").await
 }
+pub async fn admin_clear_spam(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(range): Path<String>,
+) -> Response {
+    clear_operational(&state, &headers, &range, "spam").await
+}
 async fn clear_operational(
     state: &AppState,
     headers: &HeaderMap,
@@ -913,6 +958,7 @@ async fn clear_operational(
     let permission = match kind {
         "views" => "admin.views.clear",
         "activity" => "admin.activity.clear",
+        "spam" => "admin.spam.clear",
         _ => "admin.failed_logins.clear",
     };
     let Some(ctx) = api_context(state, headers, Some(permission)).await else {
@@ -932,6 +978,9 @@ async fn clear_operational(
             .retain(|item| start.map(|s| item.timestamp < s).unwrap_or(false)),
         "activity" => db
             .activity
+            .retain(|item| start.map(|s| item.timestamp < s).unwrap_or(false)),
+        "spam" => db
+            .spam
             .retain(|item| start.map(|s| item.timestamp < s).unwrap_or(false)),
         _ => db
             .failed_logins
@@ -954,6 +1003,13 @@ pub async fn gateway_guard(
     if request.uri().path() == "/healthz" {
         return next.run(request).await;
     }
+    let route = request.uri().path().to_string();
+    let method = request.method().as_str().to_string();
+    let headers = request.headers().clone();
+    let ip = security::client_ip(&headers);
+    let device = security::device(&headers);
+    let fingerprint = security::device_fingerprint(&headers);
+    let model = security::device_model(&headers);
     if let Some(secret) = &state.config.gateway_secret {
         let supplied = request
             .headers()
@@ -961,17 +1017,78 @@ pub async fn gateway_guard(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if !security::constant_time_equal(supplied, secret) {
-            return (StatusCode::NOT_FOUND, "not found").into_response();
+            let response = (StatusCode::NOT_FOUND, "not found").into_response();
+            record_spam(
+                &state,
+                &headers,
+                &ip,
+                &fingerprint,
+                &model,
+                &device,
+                &route,
+                &method,
+                404,
+            )
+            .await;
+            return response;
         }
     }
-    next.run(request).await
+    let response = next.run(request).await;
+    let status = response.status().as_u16();
+    record_spam(
+        &state,
+        &headers,
+        &ip,
+        &fingerprint,
+        &model,
+        &device,
+        &route,
+        &method,
+        status,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_spam(
+    state: &AppState,
+    headers: &HeaderMap,
+    ip: &str,
+    fingerprint: &str,
+    model: &str,
+    device: &str,
+    route: &str,
+    method: &str,
+    status: u16,
+) {
+    let username = {
+        let db = state.pub_store.read().await;
+        security::cookie_value(headers, "aegis_session")
+            .and_then(|token| db.sessions.get(&token))
+            .and_then(|session| db.users.get(&session.user_id))
+            .map(|user| user.username.clone())
+            .unwrap_or_else(|| "anonymous".into())
+    };
+    let mut db = state.pub_store.write().await;
+    db.add_spam(
+        &username,
+        ip,
+        fingerprint,
+        model,
+        device,
+        route,
+        method,
+        status,
+    );
 }
 
 pub async fn security_headers(request: Request<axum::body::Body>, next: Next) -> Response {
     let is_admin_page = request.uri().path() == "/admin";
     let mut response = next.run(request).await;
+    let is_404_page = response.status() == StatusCode::NOT_FOUND;
     let headers = response.headers_mut();
-    let csp = if is_admin_page {
+    let csp = if is_admin_page || is_404_page {
         "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'"
     } else {
         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'"

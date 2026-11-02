@@ -4,6 +4,8 @@ AegisCore is a private, single-project workspace implemented as a Rust/Axum serv
 
 Unknown paths such as `/unknown` and `/unknown/hello` return the supplied frosted-glass 404 page with a Home link. An authenticated account without `admin.dashboard.read` also receives that same 404 page for `/admin`, avoiding disclosure of the Admin route.
 
+The Admin Panel Spam tab records non-health request attempts with username or anonymous status, IP, a deterministic SHA-256 device fingerprint derived from client hints, device model, user-agent/device string, route or file path, HTTP method, status code, and timestamp. It supports Today, 7 Days, 30 Days, and All filters. Clearing Spam logs is a separate permissioned, CSRF-protected operational action; the durable schema is represented by `spam_logs` in the migration.
+
 ## Run locally
 
 Install Rust 1.78+ and run:

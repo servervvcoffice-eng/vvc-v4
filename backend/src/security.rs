@@ -5,6 +5,7 @@ use argon2::{
 use axum::http::HeaderMap;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 pub fn hash_password(password: &str) -> Result<String, String> {
@@ -55,6 +56,33 @@ pub fn device(headers: &HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .map(|v| v.chars().take(160).collect())
         .unwrap_or_else(|| "unknown".into())
+}
+pub fn device_model(headers: &HeaderMap) -> String {
+    headers
+        .get("sec-ch-ua-model")
+        .or_else(|| headers.get("x-device-model"))
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.chars().take(120).collect())
+        .unwrap_or_else(|| "unknown".into())
+}
+pub fn device_fingerprint(headers: &HeaderMap) -> String {
+    let material = format!(
+        "{}|{}|{}|{}",
+        device(headers),
+        device_model(headers),
+        headers
+            .get("accept-language")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        headers
+            .get("sec-ch-ua-platform")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+    );
+    Sha256::digest(material.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 pub fn constant_time_equal(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()

@@ -7,7 +7,7 @@ use std::{
 };
 use tokio::sync::RwLock;
 
-pub const ALL_PERMISSIONS: &[&str] = &[
+pub const ALL_PERMISSIONS: [&str; 17] = [
     "home.read",
     "about.read",
     "admin.dashboard.read",
@@ -23,6 +23,8 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     "admin.failed_logins.read",
     "admin.failed_logins.clear",
     "admin.audit_logs.read",
+    "admin.spam.read",
+    "admin.spam.clear",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,6 +109,19 @@ pub struct AuditLog {
     pub ip: String,
     pub timestamp: u64,
 }
+#[derive(Clone, Debug, Serialize)]
+pub struct SpamLog {
+    pub id: String,
+    pub username: String,
+    pub ip: String,
+    pub device_fingerprint: String,
+    pub device_model: String,
+    pub device: String,
+    pub route: String,
+    pub method: String,
+    pub status: u16,
+    pub timestamp: u64,
+}
 #[derive(Clone, Debug)]
 pub struct LoginBucket {
     pub window_started: u64,
@@ -120,6 +135,7 @@ pub struct Store {
     pub views: Vec<ViewLog>,
     pub failed_logins: Vec<FailedLogin>,
     pub audits: Vec<AuditLog>,
+    pub spam: Vec<SpamLog>,
     pub login_buckets: HashMap<String, LoginBucket>,
 }
 
@@ -173,6 +189,7 @@ impl Store {
             views: Vec::new(),
             failed_logins: Vec::new(),
             audits: Vec::new(),
+            spam: Vec::new(),
             login_buckets: HashMap::new(),
         }
     }
@@ -229,6 +246,31 @@ impl Store {
             action: action.into(),
             details: details.into(),
             ip: ip.into(),
+            timestamp: now(),
+        });
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_spam(
+        &mut self,
+        username: &str,
+        ip: &str,
+        fingerprint: &str,
+        model: &str,
+        device: &str,
+        route: &str,
+        method: &str,
+        status: u16,
+    ) {
+        self.spam.push(SpamLog {
+            id: new_id(),
+            username: username.into(),
+            ip: ip.into(),
+            device_fingerprint: fingerprint.into(),
+            device_model: model.into(),
+            device: device.into(),
+            route: route.into(),
+            method: method.into(),
+            status,
             timestamp: now(),
         });
     }

@@ -76,6 +76,7 @@ async fn main() {
             "/api/admin/failed-logins",
             get(handlers::admin_failed_logins),
         )
+        .route("/api/admin/spam", get(handlers::admin_spam))
         .route("/api/admin/audit-logs", get(handlers::admin_audit_logs))
         .route(
             "/api/admin/clear/views/:range",
@@ -88,6 +89,10 @@ async fn main() {
         .route(
             "/api/admin/clear/failed/:range",
             delete(handlers::admin_clear_failed),
+        )
+        .route(
+            "/api/admin/clear/spam/:range",
+            delete(handlers::admin_clear_spam),
         )
         .fallback(handlers::not_found)
         .with_state(state.clone())
