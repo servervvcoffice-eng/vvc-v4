@@ -13,7 +13,10 @@ use axum::{
 use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    path::{Path as FsPath, PathBuf},
+};
 
 const LOGIN_HTML: &str = include_str!("../public/login/index.html");
 const LOGIN_CSS: &str = include_str!("../public/login/style.css");
@@ -109,12 +112,35 @@ pub async fn not_found() -> Response {
         .into_response()
 }
 pub async fn routes_manifest() -> impl IntoResponse {
+    let mut routes = vec![
+        json!({"path":"/", "title":"Home"}),
+        json!({"path":"/login", "title":"Sign in"}),
+        json!({"path":"/home", "title":"Home"}),
+        json!({"path":"/about", "title":"About"}),
+        json!({"path":"/admin", "title":"Admin"}),
+    ];
+    if let Ok(mut entries) = tokio::fs::read_dir(project_root()).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !safe_segment(&name)
+                || matches!(name.as_str(), "home" | "about" | "admin" | "login")
+                || tokio::fs::metadata(path.join("index.html")).await.is_err()
+            {
+                continue;
+            }
+            routes.push(json!({"path": format!("/{name}"), "title": name}));
+        }
+    }
+    routes.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
     (
         [
             (header::CONTENT_TYPE, "application/json; charset=utf-8"),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        r#"{"routes":[{"path":"/","title":"Home"},{"path":"/login","title":"Sign in"},{"path":"/home","title":"Home"},{"path":"/about","title":"About"},{"path":"/admin","title":"Admin"}]}"#,
+        Json(json!({"routes": routes})),
     )
 }
 pub async fn login_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -401,6 +427,125 @@ pub async fn admin_file(
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "private, no-store")
         .body(Body::from(file.contents().to_vec()))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response())
+}
+
+fn project_root() -> PathBuf {
+    if let Ok(value) = std::env::var("AEGIS_PROJECT_DIR") {
+        return PathBuf::from(value);
+    }
+    let container_root = PathBuf::from("/app/project");
+    if container_root.is_dir() {
+        container_root
+    } else {
+        PathBuf::from("backend/project")
+    }
+}
+
+fn safe_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+fn safe_relative(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && !value.contains('\\')
+        && !value.contains('\0')
+        && !value.chars().any(|c| c.is_control())
+        && value.split('/').all(|part| {
+            safe_segment(part)
+                || part.ends_with(".js")
+                || part.ends_with(".css")
+                || part.ends_with(".html")
+        })
+        && !value
+            .split('/')
+            .any(|part| part == "." || part == ".." || part.is_empty())
+}
+
+fn dynamic_content_type(path: &FsPath) -> Option<&'static str> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("html") => Some("text/html; charset=utf-8"),
+        Some("css") => Some("text/css; charset=utf-8"),
+        Some("js") => Some("text/javascript; charset=utf-8"),
+        _ => None,
+    }
+}
+
+async fn read_project_file(slug: &str, relative: &str) -> Option<(Vec<u8>, &'static str)> {
+    if !safe_segment(slug) || !safe_relative(relative) {
+        return None;
+    }
+    let base = project_root().join(slug);
+    let candidate = base.join(relative);
+    let base_canonical = tokio::fs::canonicalize(&base).await.ok()?;
+    let candidate_canonical = tokio::fs::canonicalize(&candidate).await.ok()?;
+    if !candidate_canonical.starts_with(&base_canonical) {
+        return None;
+    }
+    let content_type = dynamic_content_type(&candidate_canonical)?;
+    Some((
+        tokio::fs::read(candidate_canonical).await.ok()?,
+        content_type,
+    ))
+}
+
+pub async fn dynamic_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request<Body>,
+) -> Response {
+    if request.method() != axum::http::Method::GET {
+        return not_found().await;
+    }
+    let path = request.uri().path().trim_matches('/');
+    if let Some(asset_path) = path.strip_prefix("assets/") {
+        let mut parts = asset_path.splitn(2, '/');
+        let Some(slug) = parts.next() else {
+            return not_found().await;
+        };
+        let Some(relative) = parts.next() else {
+            return not_found().await;
+        };
+        let Some((content, content_type)) = read_project_file(slug, relative).await else {
+            return not_found().await;
+        };
+        if auth_context(&state, &headers).await.is_none() {
+            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        }
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CACHE_CONTROL, "private, no-store")
+            .body(Body::from(content))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            });
+    }
+    if path.is_empty() || path.contains('/') || !safe_segment(path) {
+        return not_found().await;
+    }
+    let Some((content, _)) = read_project_file(path, "index.html").await else {
+        return not_found().await;
+    };
+    let Some(ctx) = auth_context(&state, &headers).await else {
+        return Redirect::temporary("/login").into_response();
+    };
+    let page = path.to_string();
+    let ip = security::client_ip(&headers);
+    let device = security::device(&headers);
+    let mut db = state.pub_store.write().await;
+    db.add_view(&page, &ctx.user.username, &ip, &device);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .body(Body::from(content))
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response())
 }
 
@@ -1091,10 +1236,18 @@ async fn record_spam(
 pub async fn security_headers(request: Request<axum::body::Body>, next: Next) -> Response {
     let is_admin_page = request.uri().path() == "/admin";
     let is_login_page = request.uri().path() == "/login";
+    let dynamic_segment = request.uri().path().trim_matches('/');
+    let is_dynamic_page = safe_segment(dynamic_segment)
+        && !matches!(
+            dynamic_segment,
+            "" | "home" | "about" | "admin" | "login" | "health" | "healthz"
+        )
+        && !dynamic_segment.starts_with("api")
+        && !dynamic_segment.starts_with("assets");
     let mut response = next.run(request).await;
     let is_404_page = response.status() == StatusCode::NOT_FOUND;
     let headers = response.headers_mut();
-    let csp = if is_admin_page || is_login_page || is_404_page {
+    let csp = if is_admin_page || is_login_page || is_dynamic_page || is_404_page {
         "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'"
     } else {
         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'"

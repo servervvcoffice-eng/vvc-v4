@@ -95,7 +95,7 @@ async fn main() {
             "/api/admin/clear/spam/:range",
             delete(handlers::admin_clear_spam),
         )
-        .fallback(handlers::not_found)
+        .fallback(handlers::dynamic_route)
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(config.max_body_bytes))
         .layer(middleware::from_fn_with_state(

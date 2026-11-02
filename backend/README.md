@@ -1,6 +1,6 @@
 # AegisCore
 
-AegisCore is a private, single-project workspace implemented as a Rust/Axum service. The public login page is available at `/login`; `/home`, `/about`, `/admin`, and all private assets are served only after server-side authentication and explicit permission checks. `backend/project/` is source data compiled into allowlisted handlers; it is not a static web root.
+AegisCore is a private, single-project workspace implemented as a Rust/Axum service. The public login page is available at `/login`; `/home`, `/about`, `/admin`, and all private assets are served only after server-side authentication and explicit permission checks. `project/` is a private page workspace, not a public static web root. Built-in pages keep their explicit handlers, while new page folders are discovered automatically at runtime.
 
 Unknown paths such as `/unknown` and `/unknown/hello` return the supplied frosted-glass 404 page with a Home link. An authenticated account without `admin.dashboard.read` also receives that same 404 page for `/admin`, avoiding disclosure of the Admin route.
 
@@ -21,6 +21,28 @@ Open `http://localhost:3000/login`. The development seed account is `superadmin`
 ### Admin page assets
 
 The Admin Panel is self-contained: its reference-matched CSS and JavaScript are embedded in `project/admin/index.html`, so the page still renders and functions if `style.css` or `app.js` is absent. Those files remain optional source-of-truth files for editing and can use any filename. Additional files placed under `project/admin/` can be connected from the page and are served only to authenticated users with `admin.dashboard.read` through `/assets/admin/<safe-relative-path>`; traversal, control characters, and absolute paths are rejected.
+
+### Add a page by uploading files only
+
+Create a folder under `project/` with an `index.html` file; no Rust route, handler, permission catalog, or route-manifest edit is required:
+
+```text
+project/reports/
+├── index.html
+├── style.css
+├── helpers.js
+└── app.js
+```
+
+The page is automatically available to authenticated users at `/reports`. Connect same-folder CSS or JavaScript using the page slug:
+
+```html
+<link rel="stylesheet" href="/assets/reports/style.css">
+<script src="/assets/reports/helpers.js" defer></script>
+<script src="/assets/reports/app.js" defer></script>
+```
+
+Any safe nested `.html`, `.css`, or `.js` file under that folder is served through `/assets/reports/...`; assets require an authenticated session. New pages are authenticated by default and available to all authenticated roles. Keep secrets, server code, migrations, and database credentials outside `project/`. Path traversal, absolute paths, control characters, symlinks escaping the page folder, and unsupported file types are rejected. The route manifest discovers the new page automatically.
 
 ## Production persistence and deployment
 
