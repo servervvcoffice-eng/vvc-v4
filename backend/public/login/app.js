@@ -1,13 +1,44 @@
-const form = document.querySelector('#login-form');
-const error = document.querySelector('#login-error');
-const button = form.querySelector('button');
+const form = document.getElementById('loginForm');
+const email = document.getElementById('email');
+const pass = document.getElementById('password');
+const eye = document.getElementById('eye');
+const error = document.getElementById('loginError');
+const button = form.querySelector('.login');
+
+function togglePassword() {
+  const showing = pass.type === 'password';
+  pass.type = showing ? 'text' : 'password';
+  eye.textContent = showing ? 'HIDE' : 'SHOW';
+  eye.setAttribute('aria-label', showing ? 'Hide password' : 'Show password');
+}
+
+eye.addEventListener('click', togglePassword);
+eye.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' || event.key === ' ') {
+    event.preventDefault();
+    togglePassword();
+  }
+});
+
 form.addEventListener('submit', async (event) => {
-  event.preventDefault(); error.hidden = true; button.disabled = true;
-  const username = form.username.value.trim(); const password = form.password.value;
+  event.preventDefault();
+  error.hidden = true;
+  button.disabled = true;
+  button.textContent = 'Signing in';
   try {
-    const response = await fetch('/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({username,password})});
+    const response = await fetch('/login', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: email.value.trim(), password: pass.value })
+    });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || 'Unable to sign in.');
+    if (!response.ok) throw new Error(data.error || 'Unable to sign in');
     window.location.assign(data.redirect || '/home');
-  } catch (err) { error.textContent = err.message; error.hidden = false; button.disabled = false; }
+  } catch (err) {
+    error.textContent = err.message;
+    error.hidden = false;
+    button.disabled = false;
+    button.textContent = 'Sign in';
+  }
 });
