@@ -495,6 +495,11 @@ pub async fn admin_stats(
         .iter()
         .filter(|v| v.timestamp >= seven.unwrap_or(0))
         .count();
+    let today_spam = db
+        .spam
+        .iter()
+        .filter(|item| item.timestamp >= today.unwrap_or(0))
+        .count();
     let recent_activity: Vec<_> = db
         .activity
         .iter()
@@ -504,7 +509,7 @@ pub async fn admin_stats(
         .cloned()
         .collect();
     drop(ctx);
-    Json(json!({"total_users": total_users, "today_views": today_views, "seven_day_views": seven_day_views, "blocked_users": blocked_users, "recent_activity": recent_activity})).into_response()
+    Json(json!({"total_users": total_users, "today_views": today_views, "seven_day_views": seven_day_views, "blocked_users": blocked_users, "today_spam": today_spam, "recent_activity": recent_activity})).into_response()
 }
 
 pub async fn admin_activity(
