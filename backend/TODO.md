@@ -16,7 +16,7 @@ The route boundary, protected pages/assets, session authentication, CSRF, RBAC, 
 - [ ] Protect state changes with CSRF validation, rate-limit login attempts, apply progressive abuse controls, validate inputs, use bounded requests, safe response headers, strict CORS, and parameterized database-query boundaries.
 
 ## 3. Roles and permissions
-- [ ] Implement Super Admin, delegated Admin, and optional Viewer semantics with granular permissions.
+- [ ] Implement Super Admin, delegated Admin, and optional User semantics with granular permissions.
 - [ ] Prevent ordinary Admins from creating/assigning Super Admin privileges or granting permissions beyond delegation scope.
 - [ ] Check exact permissions on every protected page and every protected API operation; frontend visibility is not authorization.
 

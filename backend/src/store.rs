@@ -30,7 +30,7 @@ pub const ALL_PERMISSIONS: &[&str] = &[
 pub enum Role {
     SuperAdmin,
     Admin,
-    Viewer,
+    User,
 }
 
 impl Role {
@@ -38,14 +38,14 @@ impl Role {
         match self {
             Self::SuperAdmin => "Super Admin",
             Self::Admin => "Admin",
-            Self::Viewer => "Viewer",
+            Self::User => "User",
         }
     }
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::SuperAdmin => "super_admin",
             Self::Admin => "admin",
-            Self::Viewer => "viewer",
+            Self::User => "viewer",
         }
     }
 }

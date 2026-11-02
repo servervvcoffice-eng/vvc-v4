@@ -28,7 +28,8 @@ create index if not exists view_logs_created_idx on view_logs(created_at);
 create table if not exists activity_logs (id uuid primary key default gen_random_uuid(), user_id uuid references users(id) on delete set null, username_snapshot text not null, action text not null, details text not null, ip_address inet, created_at timestamptz not null default now());
 create index if not exists activity_logs_created_idx on activity_logs(created_at);
 
-insert into roles(id,label) values ('super_admin','Super Admin'),('admin','Admin'),('viewer','Viewer') on conflict do nothing;
+insert into roles(id,label) values ('super_admin','Super Admin'),('admin','Admin'),('viewer','User') on conflict do nothing;
+update roles set label = 'User' where id = 'viewer';
 insert into permissions(id,label) values
  ('home.read','Read Home'),('about.read','Read About'),('admin.dashboard.read','Read Admin Dashboard'),('admin.users.read','Read Users'),('admin.users.create','Create Users'),('admin.users.update_role','Update User Roles'),('admin.users.block','Block Users'),('admin.users.delete','Delete Users'),('admin.views.read','Read Views'),('admin.views.clear','Clear Views'),('admin.activity.read','Read Activity'),('admin.activity.clear','Clear Activity'),('admin.failed_logins.read','Read Failed Logins'),('admin.failed_logins.clear','Clear Failed Logins'),('admin.audit_logs.read','Read Audit Logs') on conflict do nothing;
 insert into role_permissions(role_id,permission_id) select 'super_admin',id from permissions on conflict do nothing;

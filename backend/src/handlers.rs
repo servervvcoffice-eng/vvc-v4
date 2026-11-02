@@ -89,8 +89,8 @@ struct Paged<T: Serialize> {
     limit: usize,
 }
 
-pub async fn root() -> Redirect {
-    Redirect::temporary("/login")
+pub async fn root(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    protected_page(&state, &headers, "home.read", HOME_HTML, "Home").await
 }
 pub async fn healthz() -> impl IntoResponse {
     (
@@ -105,11 +105,14 @@ pub async fn routes_manifest() -> impl IntoResponse {
             (header::CONTENT_TYPE, "application/json; charset=utf-8"),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        r#"{"routes":[{"path":"/login","title":"Sign in"},{"path":"/home","title":"Home"},{"path":"/about","title":"About"},{"path":"/admin","title":"Admin"}]}"#,
+        r#"{"routes":[{"path":"/","title":"Home"},{"path":"/login","title":"Sign in"},{"path":"/home","title":"Home"},{"path":"/about","title":"About"},{"path":"/admin","title":"Admin"}]}"#,
     )
 }
-pub async fn login_page() -> Html<&'static str> {
-    Html(LOGIN_HTML)
+pub async fn login_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if auth_context(&state, &headers).await.is_some() {
+        return Redirect::temporary("/home").into_response();
+    }
+    Html(LOGIN_HTML).into_response()
 }
 pub async fn login_css() -> impl IntoResponse {
     (
@@ -792,7 +795,7 @@ pub async fn admin_roles(State(state): State<AppState>, headers: HeaderMap) -> R
     {
         return json_error(StatusCode::FORBIDDEN, "Permission required");
     }
-    Json(json!({"roles":[{"id":"super_admin","label":"Super Admin"},{"id":"admin","label":"Admin"},{"id":"viewer","label":"Viewer"}],"permissions": store::ALL_PERMISSIONS})).into_response()
+    Json(json!({"roles":[{"id":"super_admin","label":"Super Admin"},{"id":"admin","label":"Admin"},{"id":"viewer","label":"User"}],"permissions": store::ALL_PERMISSIONS})).into_response()
 }
 
 pub async fn admin_views(
@@ -1084,7 +1087,7 @@ fn parse_role(value: &str) -> Option<Role> {
     match value {
         "super_admin" => Some(Role::SuperAdmin),
         "admin" => Some(Role::Admin),
-        "viewer" => Some(Role::Viewer),
+        "viewer" => Some(Role::User),
         _ => None,
     }
 }
@@ -1102,7 +1105,7 @@ fn delegated_permissions(actor: &User, role: &Role) -> HashSet<String> {
             .filter(|p| **p != "admin.audit_logs.read")
             .map(|s| (*s).to_string())
             .collect(),
-        Role::Viewer => ["home.read", "about.read"]
+        Role::User => ["home.read", "about.read"]
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
