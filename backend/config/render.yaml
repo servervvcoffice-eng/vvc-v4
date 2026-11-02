@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: aegiscore
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: AEGIS_DEV_PASSWORD
+        sync: false
+      - key: AEGIS_GATEWAY_SECRET
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
