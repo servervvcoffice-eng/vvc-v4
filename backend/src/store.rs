@@ -1,8 +1,10 @@
 use crate::{config::Config, security};
 use serde::{Deserialize, Serialize};
+use sqlx::{postgres::{PgConnectOptions, PgPoolOptions}, PgPool, Row};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::RwLock;
@@ -143,6 +145,123 @@ pub struct Store {
 pub struct AppState {
     pub pub_store: Arc<RwLock<Store>>,
     pub config: Config,
+    pub persistence: Option<Arc<Persistence>>,
+}
+
+#[derive(Clone)]
+pub struct Persistence {
+    pool: PgPool,
+}
+
+impl Persistence {
+    pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
+        let options = PgConnectOptions::from_str(database_url)?.statement_cache_capacity(0);
+        let pool = PgPoolOptions::new().max_connections(4).connect_with(options).await?;
+        sqlx::query("select 1").persistent(false).execute(&pool).await?;
+        Ok(Self { pool })
+    }
+
+    pub async fn load_users(&self, store: &mut Store) -> Result<usize, sqlx::Error> {
+        let rows = sqlx::query(
+            "select id::text as id, username, email, password_hash, blocked, failed_login_count,
+                    floor(extract(epoch from last_login_at))::bigint as last_login,
+                    floor(extract(epoch from created_at))::bigint as created_at
+             from users order by created_at asc",
+        )
+        .persistent(false)
+        .fetch_all(&self.pool)
+        .await?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut users = HashMap::new();
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            let role_id: Option<String> = sqlx::query_scalar(
+                "select role_id from user_roles where user_id = $1::uuid order by role_id limit 1",
+            )
+            .persistent(false)
+            .bind(&id)
+            .fetch_optional(&self.pool)
+            .await?;
+            let role = match role_id.as_deref() {
+                Some("super_admin") => Role::SuperAdmin,
+                Some("admin") => Role::Admin,
+                _ => Role::User,
+            };
+            let delegated_permissions = permissions_for_role(&role);
+            users.insert(
+                id.clone(),
+                User {
+                    id,
+                    username: row.try_get("username")?,
+                    email: row.try_get("email")?,
+                    password_hash: row.try_get("password_hash")?,
+                    role,
+                    delegated_permissions,
+                    blocked: row.try_get("blocked")?,
+                    failed_login_count: row.try_get::<i32, _>("failed_login_count")?.max(0) as u32,
+                    last_login: row.try_get::<Option<i64>, _>("last_login")?.map(|v| v as u64),
+                    created_at: row.try_get::<i64, _>("created_at")? as u64,
+                },
+            );
+        }
+        store.users = users;
+        Ok(store.users.len())
+    }
+
+    pub async fn sync_users(&self, store: &Store) -> Result<(), sqlx::Error> {
+        for user in store.users.values() {
+            if uuid::Uuid::parse_str(&user.id).is_err() {
+                continue;
+            }
+            sqlx::query(
+                "insert into users (id, username, email, password_hash, blocked, failed_login_count, last_login_at)
+                 values ($1::uuid, $2, $3, $4, $5, $6, to_timestamp($7))
+                 on conflict (id) do update set username=excluded.username, email=excluded.email,
+                 password_hash=excluded.password_hash, blocked=excluded.blocked,
+                 failed_login_count=excluded.failed_login_count, last_login_at=excluded.last_login_at,
+                 updated_at=now()",
+            )
+            .persistent(false)
+            .bind(&user.id)
+            .bind(&user.username)
+            .bind(&user.email)
+            .bind(&user.password_hash)
+            .bind(user.blocked)
+            .bind(user.failed_login_count as i32)
+            .bind(user.last_login.map(|v| v as i64))
+            .execute(&self.pool)
+            .await?;
+            sqlx::query("delete from user_roles where user_id = $1::uuid")
+                .persistent(false)
+                .bind(&user.id)
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("insert into user_roles(user_id, role_id) values ($1::uuid, $2) on conflict do nothing")
+                .persistent(false)
+                .bind(&user.id)
+                .bind(user.role.as_str())
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+fn permissions_for_role(role: &Role) -> HashSet<String> {
+    match role {
+        Role::SuperAdmin => ALL_PERMISSIONS.iter().map(|s| (*s).to_string()).collect(),
+        Role::Admin => ALL_PERMISSIONS
+            .iter()
+            .filter(|permission| **permission != "admin.audit_logs.read")
+            .map(|s| (*s).to_string())
+            .collect(),
+        Role::User => ["home.read", "about.read"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    }
 }
 
 pub fn now() -> u64 {

@@ -4,6 +4,7 @@ use std::{env, net::SocketAddr};
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub app_env: String,
+    pub database_url: Option<String>,
     pub session_idle_secs: u64,
     pub session_absolute_secs: u64,
     pub max_body_bytes: usize,
@@ -19,6 +20,9 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(3000);
         let app_env = env::var("APP_ENV").unwrap_or_else(|_| "development".into());
+        let database_url = env::var("DATABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
         let dev_password =
             env::var("AEGIS_DEV_PASSWORD").unwrap_or_else(|_| "ChangeMeNow!42".into());
         let gateway_secret = env::var("AEGIS_GATEWAY_SECRET")
@@ -33,6 +37,7 @@ impl Config {
         Self {
             bind_addr: SocketAddr::from(([0, 0, 0, 0], port)),
             app_env,
+            database_url,
             session_idle_secs: env::var("SESSION_IDLE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())

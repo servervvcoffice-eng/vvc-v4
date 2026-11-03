@@ -27,10 +27,49 @@ async fn main() {
         tracing::error!("production startup refused: this build uses the Preview in-memory repository; wire the durable Supabase/Redis adapters, gateway secret, and one-time bootstrap flow before production");
         std::process::exit(78);
     }
-    let state = AppState {
-        pub_store: Arc::new(tokio::sync::RwLock::new(Store::seeded(&config))),
-        config: config.clone(),
+    let persistence = if let Some(database_url) = &config.database_url {
+        match store::Persistence::connect(database_url).await {
+            Ok(persistence) => {
+                tracing::info!("Supabase PostgreSQL persistence connected");
+                Some(Arc::new(persistence))
+            }
+            Err(error) => {
+                tracing::error!(%error, "DATABASE_URL was provided but Supabase PostgreSQL connection failed");
+                std::process::exit(78);
+            }
+        }
+    } else {
+        tracing::warn!("DATABASE_URL is not configured; using process-local preview store");
+        None
     };
+    let mut initial_store = Store::seeded(&config);
+    if let Some(persistence) = &persistence {
+        match persistence.load_users(&mut initial_store).await {
+            Ok(count) if count > 0 => tracing::info!(users = count, "Loaded users from Supabase"),
+            Ok(_) => tracing::warn!("Supabase users table is empty; retaining development seed"),
+            Err(error) => {
+                tracing::error!(%error, "Could not load users from Supabase");
+                std::process::exit(78);
+            }
+        }
+    }
+    let state = AppState {
+        pub_store: Arc::new(tokio::sync::RwLock::new(initial_store)),
+        config: config.clone(),
+        persistence,
+    };
+    if let Some(persistence) = state.persistence.clone() {
+        let sync_store = state.pub_store.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let db = sync_store.read().await;
+                if let Err(error) = persistence.sync_users(&db).await {
+                    tracing::error!(%error, "Supabase user sync failed");
+                }
+            }
+        });
+    }
     tracing::info!(environment = %config.app_env, "AegisCore configuration loaded");
     let app = Router::new()
         .route("/", get(handlers::root))
