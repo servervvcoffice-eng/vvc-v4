@@ -1,7 +1,6 @@
 const HOP_BY_HOP = new Set([
   'connection',
   'content-length',
-  'content-encoding',
   'host',
   'keep-alive',
   'proxy-authenticate',
