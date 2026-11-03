@@ -1,5 +1,3 @@
-const BACKEND_ORIGIN = (process.env.BACKEND_ORIGIN || 'https://vvcoffice.onrender.com').replace(/\/$/, '');
-
 const HOP_BY_HOP = new Set([
   'connection',
   'content-length',
@@ -15,7 +13,15 @@ const HOP_BY_HOP = new Set([
 
 exports.handler = async (event) => {
   const gatewaySecret = process.env.AEGIS_GATEWAY_SECRET;
-  if (!gatewaySecret) {
+  const backendOrigin = process.env.BACKEND_ORIGIN;
+  if (!gatewaySecret || !backendOrigin) {
+    return { statusCode: 503, body: 'Frontend proxy is not configured' };
+  }
+  let backend;
+  try {
+    backend = new URL(backendOrigin);
+    if (backend.protocol !== 'https:') throw new Error('backend must use HTTPS');
+  } catch (_error) {
     return { statusCode: 503, body: 'Frontend proxy is not configured' };
   }
 
@@ -27,7 +33,7 @@ exports.handler = async (event) => {
   }
   const path = incoming?.pathname || event.path.replace(/^\/.netlify\/functions\/proxy/, '') || '/';
   const query = incoming?.search || (event.rawQuery ? `?${event.rawQuery}` : '');
-  const target = `${BACKEND_ORIGIN}${path}${query}`;
+  const target = `${backend.origin}${backend.pathname.replace(/\/$/, '')}${path}${query}`;
   const headers = new Headers();
 
   for (const [name, value] of Object.entries(event.headers || {})) {

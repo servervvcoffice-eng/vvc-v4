@@ -7,7 +7,7 @@ This folder is deployed as a separate Netlify site. It proxies every public rout
 Set these in the Netlify site, not in GitHub:
 
 ```text
-BACKEND_ORIGIN=https://vvcoffice.onrender.com
+BACKEND_ORIGIN=https://your-render-service.example.com
 AEGIS_GATEWAY_SECRET=<the same value configured on Render>
 ```
 
