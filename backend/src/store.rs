@@ -1,10 +1,13 @@
 use crate::{config::Config, security};
 use serde::{Deserialize, Serialize};
-use sqlx::{postgres::{PgConnectOptions, PgPoolOptions}, PgPool, Row};
+use sqlx::{
+    postgres::{PgConnectOptions, PgPoolOptions},
+    PgPool, Row,
+};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
     str::FromStr,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::RwLock;
@@ -156,8 +159,14 @@ pub struct Persistence {
 impl Persistence {
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
         let options = PgConnectOptions::from_str(database_url)?.statement_cache_capacity(0);
-        let pool = PgPoolOptions::new().max_connections(4).connect_with(options).await?;
-        sqlx::query("select 1").persistent(false).execute(&pool).await?;
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await?;
+        sqlx::query("select 1")
+            .persistent(false)
+            .execute(&pool)
+            .await?;
         Ok(Self { pool })
     }
 
@@ -201,7 +210,9 @@ impl Persistence {
                     delegated_permissions,
                     blocked: row.try_get("blocked")?,
                     failed_login_count: row.try_get::<i32, _>("failed_login_count")?.max(0) as u32,
-                    last_login: row.try_get::<Option<i64>, _>("last_login")?.map(|v| v as u64),
+                    last_login: row
+                        .try_get::<Option<i64>, _>("last_login")?
+                        .map(|v| v as u64),
                     created_at: row.try_get::<i64, _>("created_at")? as u64,
                 },
             );

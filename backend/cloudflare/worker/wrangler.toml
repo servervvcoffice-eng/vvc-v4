@@ -1,0 +1,8 @@
+name = "aegiscore-gateway"
+main = "index.js"
+compatibility_date = "2026-11-03"
+
+# Set ORIGIN_URL as a Worker variable and ORIGIN_GATEWAY_SECRET with:
+# wrangler secret put ORIGIN_GATEWAY_SECRET
+[vars]
+ORIGIN_URL = "https://replace-with-render-origin.example.com"

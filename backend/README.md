@@ -50,6 +50,19 @@ Apply `migrations/001_init.sql` to a dedicated Supabase PostgreSQL project. Conf
 
 `Dockerfile` builds the service and honors `PORT`; its default `APP_ENV=preview` is intentionally for a temporary hosted Preview and uses server-process state. `config/render.yaml` describes the intended Render production shape, but the current binary deliberately refuses `APP_ENV=production` because its runnable repository is still process-local. Do not deploy it as production until the PostgreSQL/Supabase and Redis adapters, one-time bootstrap flow, and gateway secret enforcement are wired. Put the eventual Render origin behind the Cloudflare Worker in `cloudflare/worker/index.js`, set a rotated `AEGIS_GATEWAY_SECRET` in both server-side secret stores, and configure Cloudflare WAF/rate rules. The backend still performs authentication and authorization even when a request passed the gateway. If the Render origin cannot be made private, require gateway verification on every relevant request and restrict origin access at the hosting layer where possible.
 
+### Cloudflare Worker deployment
+
+The Worker gateway configuration is in `cloudflare/worker/wrangler.toml`. Set `ORIGIN_URL` to the Render service URL without a trailing path, and keep `ORIGIN_GATEWAY_SECRET` only as a Worker secret. Use the same randomly generated value for Render's `AEGIS_GATEWAY_SECRET`; never commit either value:
+
+```bash
+cd cloudflare/worker
+npx wrangler login
+npx wrangler secret put ORIGIN_GATEWAY_SECRET
+npx wrangler deploy
+```
+
+The Worker strips client-supplied identity and forwarding headers, overwrites the gateway header, and forwards the request to Render. Configure the public DNS route to the Worker, then add Cloudflare WAF and rate-limit rules. Do not expose the Render hostname publicly if the hosting plan supports private origin controls. If the origin remains reachable, the Rust backend's gateway check must stay enabled with `AEGIS_GATEWAY_SECRET` set; otherwise direct-origin requests are not protected by the edge layer.
+
 ## Security posture
 
 Argon2id hashes passwords. Session identifiers are random opaque values stored server-side and rotated on login and privilege changes. Cookies are Secure and HttpOnly with `SameSite=None` for embedded HTTPS Preview; state-changing requests require the per-session CSRF token in `X-CSRF-Token`. The service uses a strict content-security policy, request body limits, timeouts, generic login failures, rate limits, audit/activity separation, and protected last-Super-Admin safeguards.
