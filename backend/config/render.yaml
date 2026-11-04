@@ -1,8 +1,10 @@
 services:
   - type: web
     name: aegiscore
-    runtime: docker
-    dockerfilePath: ./backend/Dockerfile
+    runtime: rust
+    rootDir: backend
+    buildCommand: cargo build --release
+    startCommand: ./target/release/aegiscore
     healthCheckPath: /healthz
     envVars:
       - key: APP_ENV
