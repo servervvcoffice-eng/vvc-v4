@@ -14,7 +14,7 @@ const HOP_BY_HOP = new Set([
 
 export async function onRequest(context) {
   const { request, env } = context;
-  const gatewaySecret = env.AEGIS_GATEWAY_SECRET;
+  const gatewaySecret = env.VVC_GATEWAY_SECRET;
   const backendOrigin = env.BACKEND_ORIGIN;
 
   if (!gatewaySecret || !backendOrigin) {
@@ -36,20 +36,20 @@ export async function onRequest(context) {
   const headers = new Headers(request.headers);
   for (const name of [
     ...HOP_BY_HOP,
-    'x-aegis-gateway',
+    'x-vvc-gateway',
     'x-user-id',
     'x-user-role',
     'x-forwarded-for',
     'x-forwarded-host',
     'x-forwarded-proto',
-    'x-aegis-request-id',
+    'x-vvc-request-id',
   ]) {
     headers.delete(name);
   }
-  headers.set('x-aegis-gateway', gatewaySecret);
+  headers.set('x-vvc-gateway', gatewaySecret);
   headers.set('x-forwarded-proto', 'https');
   headers.set('x-forwarded-host', incoming.host);
-  headers.set('x-aegis-request-id', crypto.randomUUID());
+  headers.set('x-vvc-request-id', crypto.randomUUID());
 
   let response;
   try {

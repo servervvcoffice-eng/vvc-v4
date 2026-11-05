@@ -90,15 +90,15 @@ pub fn constant_time_equal(a: &str, b: &str) -> bool {
 
 pub fn session_cookie(token: &str, max_age: u64, secure: bool) -> String {
     if secure {
-        format!("aegis_session={token}; Path=/; Max-Age={max_age}; HttpOnly; Secure; SameSite=None")
+        format!("vvc_session={token}; Path=/; Max-Age={max_age}; HttpOnly; Secure; SameSite=None")
     } else {
-        format!("aegis_session={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax")
+        format!("vvc_session={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax")
     }
 }
 pub fn expired_session_cookie(secure: bool) -> String {
     if secure {
-        "aegis_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None".into()
+        "vvc_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None".into()
     } else {
-        "aegis_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax".into()
+        "vvc_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax".into()
     }
 }

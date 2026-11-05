@@ -8,7 +8,7 @@ Set these in the Netlify site, not in GitHub:
 
 ```text
 BACKEND_ORIGIN=https://your-render-service.example.com
-AEGIS_GATEWAY_SECRET=<the same value configured on Render>
+VVC_GATEWAY_SECRET=<the same value configured on Render>
 ```
 
-`AEGIS_GATEWAY_SECRET` is used only by the Netlify function. Never put it in `index.html`, browser JavaScript, or public environment variables.
+`VVC_GATEWAY_SECRET` is used only by the Netlify function. Never put it in `index.html`, browser JavaScript, or public environment variables.

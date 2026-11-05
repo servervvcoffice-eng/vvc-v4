@@ -263,7 +263,7 @@ pub async fn login(
 }
 
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let token = security::cookie_value(&headers, "aegis_session");
+    let token = security::cookie_value(&headers, "vvc_session");
     let Some(token) = token else {
         return (
             StatusCode::NO_CONTENT,
@@ -431,7 +431,7 @@ pub async fn admin_file(
 }
 
 fn project_root() -> PathBuf {
-    if let Ok(value) = std::env::var("AEGIS_PROJECT_DIR") {
+    if let Ok(value) = std::env::var("VVC_PROJECT_DIR") {
         return PathBuf::from(value);
     }
     let container_root = PathBuf::from("/app/project");
@@ -1163,7 +1163,7 @@ pub async fn gateway_guard(
     if let Some(secret) = &state.config.gateway_secret {
         let supplied = request
             .headers()
-            .get("x-aegis-gateway")
+            .get("x-vvc-gateway")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if !security::constant_time_equal(supplied, secret) {
@@ -1214,7 +1214,7 @@ async fn record_spam(
 ) {
     let username = {
         let db = state.pub_store.read().await;
-        security::cookie_value(headers, "aegis_session")
+        security::cookie_value(headers, "vvc_session")
             .and_then(|token| db.sessions.get(&token))
             .and_then(|session| db.users.get(&session.user_id))
             .map(|user| user.username.clone())
@@ -1267,7 +1267,7 @@ pub async fn security_headers(request: Request<axum::body::Body>, next: Next) ->
 }
 
 async fn auth_context(state: &AppState, headers: &HeaderMap) -> Option<AuthContext> {
-    let token = security::cookie_value(headers, "aegis_session")?;
+    let token = security::cookie_value(headers, "vvc_session")?;
     let mut db = state.pub_store.write().await;
     let now = store::now();
     let session = db.sessions.get(&token).cloned()?;

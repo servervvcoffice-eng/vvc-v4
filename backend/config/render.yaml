@@ -11,9 +11,9 @@ services:
         value: production
       - key: PORT
         value: 3000
-      - key: AEGIS_DEV_PASSWORD
+      - key: VVC_DEV_PASSWORD
         sync: false
-      - key: AEGIS_GATEWAY_SECRET
+      - key: VVC_GATEWAY_SECRET
         sync: false
       - key: DATABASE_URL
         sync: false

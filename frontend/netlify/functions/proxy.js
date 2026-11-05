@@ -13,7 +13,7 @@ const HOP_BY_HOP = new Set([
 ]);
 
 exports.handler = async (event) => {
-  const gatewaySecret = process.env.AEGIS_GATEWAY_SECRET;
+  const gatewaySecret = process.env.VVC_GATEWAY_SECRET;
   const backendOrigin = process.env.BACKEND_ORIGIN;
   if (!gatewaySecret || !backendOrigin) {
     return { statusCode: 503, body: 'Frontend proxy is not configured' };
@@ -40,7 +40,7 @@ exports.handler = async (event) => {
   for (const [name, value] of Object.entries(event.headers || {})) {
     const lower = name.toLowerCase();
     if (!HOP_BY_HOP.has(lower) && ![
-      'x-aegis-gateway',
+      'x-vvc-gateway',
       'x-user-id',
       'x-user-role',
       'x-forwarded-for',
@@ -50,7 +50,7 @@ exports.handler = async (event) => {
       headers.set(name, value);
     }
   }
-  headers.set('x-aegis-gateway', gatewaySecret);
+  headers.set('x-vvc-gateway', gatewaySecret);
   headers.set('x-forwarded-proto', 'https');
   headers.set('x-forwarded-host', event.headers?.host || '');
 

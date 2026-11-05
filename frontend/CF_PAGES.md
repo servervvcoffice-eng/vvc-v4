@@ -19,10 +19,10 @@ Add these as server-side variables/secrets for Production and Preview:
 
 ```text
 BACKEND_ORIGIN=https://your-render-service.example.com
-AEGIS_GATEWAY_SECRET=<the same secret configured as Render AEGIS_GATEWAY_SECRET>
+VVC_GATEWAY_SECRET=<the same secret configured as Render VVC_GATEWAY_SECRET>
 ```
 
-Set `AEGIS_GATEWAY_SECRET` as an encrypted Secret, not a public variable. Do not place it in `index.html`, browser JavaScript, or GitHub.
+Set `VVC_GATEWAY_SECRET` as an encrypted Secret, not a public variable. Do not place it in `index.html`, browser JavaScript, or GitHub.
 
 After deployment, test:
 

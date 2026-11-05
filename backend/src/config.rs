@@ -23,16 +23,15 @@ impl Config {
         let database_url = env::var("DATABASE_URL")
             .ok()
             .filter(|value| !value.trim().is_empty());
-        let dev_password =
-            env::var("AEGIS_DEV_PASSWORD").unwrap_or_else(|_| "ChangeMeNow!42".into());
-        let gateway_secret = env::var("AEGIS_GATEWAY_SECRET")
+        let dev_password = env::var("VVC_DEV_PASSWORD").unwrap_or_else(|_| "ChangeMeNow!42".into());
+        let gateway_secret = env::var("VVC_GATEWAY_SECRET")
             .ok()
             .filter(|v| !v.is_empty());
         let cookie_secure = env::var("COOKIE_SECURE")
             .map(|v| !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
         if app_env == "production" && dev_password == "ChangeMeNow!42" {
-            tracing::warn!("AEGIS_DEV_PASSWORD is using the development placeholder; production bootstrap should provide a real secret");
+            tracing::warn!("VVC_DEV_PASSWORD is using the development placeholder; production bootstrap should provide a real secret");
         }
         Self {
             bind_addr: SocketAddr::from(([0, 0, 0, 0], port)),

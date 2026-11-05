@@ -1,5 +1,5 @@
-if (!window.__aegisLoginBound) {
-  window.__aegisLoginBound = true;
+if (!window.__vvcLoginBound) {
+  window.__vvcLoginBound = true;
   const form = document.getElementById('loginForm');
   const username = document.getElementById('username');
   const pass = document.getElementById('password');

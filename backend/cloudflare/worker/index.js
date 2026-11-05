@@ -16,19 +16,19 @@ export default {
     const headers = new Headers(request.headers);
     // Never trust client-supplied identity/forwarding headers.
     for (const name of [
-      'x-aegis-gateway',
+      'x-vvc-gateway',
       'x-user-id',
       'x-user-role',
       'x-forwarded-user',
       'x-forwarded-for',
       'x-forwarded-host',
       'x-forwarded-proto',
-      'x-aegis-request-id',
+      'x-vvc-request-id',
     ]) headers.delete(name);
-    headers.set('x-aegis-gateway', env.ORIGIN_GATEWAY_SECRET);
+    headers.set('x-vvc-gateway', env.ORIGIN_GATEWAY_SECRET);
     headers.set('x-forwarded-proto', 'https');
     headers.set('x-forwarded-host', url.host);
-    headers.set('x-aegis-request-id', crypto.randomUUID());
+    headers.set('x-vvc-request-id', crypto.randomUUID());
     return fetch(new Request(forwarded, { headers }));
   }
 };
