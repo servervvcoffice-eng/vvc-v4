@@ -1,5 +1,5 @@
 /**
- * AegisCore edge gateway.
+ * VVC Office edge gateway.
  * ORIGIN_URL is a Worker variable; ORIGIN_GATEWAY_SECRET is a Worker secret.
  * Configure Cloudflare WAF and rate rules before this Worker.
  */

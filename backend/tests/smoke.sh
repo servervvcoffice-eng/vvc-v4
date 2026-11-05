@@ -19,10 +19,10 @@ curl -fsS -c "$COOKIE_JAR" -H 'content-type: application/json' -d "{\"username\"
 ME="$(curl -fsS -b "$COOKIE_JAR" "$BASE_URL/api/me")"
 CSRF="$(printf '%s' "$ME" | sed -n 's/.*"csrf_token":"\([^"]*\)".*/\1/p')"
 test -n "$CSRF"
-curl -fsS -b "$COOKIE_JAR" "$BASE_URL/admin" | grep -q 'AegisCore'
-curl -fsS -b "$COOKIE_JAR" "$BASE_URL/" | grep -q 'AegisCore'
+curl -fsS -b "$COOKIE_JAR" "$BASE_URL/admin" | grep -q 'VVC Office'
+curl -fsS -b "$COOKIE_JAR" "$BASE_URL/" | grep -q 'VVC Office'
 curl -fsS -b "$COOKIE_JAR" -D /tmp/aegis-login-auth-headers "$BASE_URL/login" -o /dev/null
 grep -q 'location: /home' /tmp/aegis-login-auth-headers
 if curl -fsS -b "$COOKIE_JAR" -X DELETE "$BASE_URL/api/admin/clear/views/all" >/dev/null 2>&1; then echo 'CSRF bypass'; exit 1; fi
 curl -fsS -b "$COOKIE_JAR" -H "X-CSRF-Token: $CSRF" -X POST "$BASE_URL/logout" -o /dev/null
-printf 'AegisCore smoke checks passed.\n'
+printf 'VVC Office smoke checks passed.\n'

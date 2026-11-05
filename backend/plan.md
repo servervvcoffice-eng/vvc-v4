@@ -1,8 +1,8 @@
-# AegisCore implementation plan
+# VVC Office implementation plan
 
 ## Scope and implementation approach
 
-AegisCore is implemented as one private workspace. The Rust/Axum service is the only web root: it serves the public login page directly and serves every private HTML/CSS/JavaScript asset through explicit authenticated routes. `backend/project/` is never mounted as a static directory and no request-controlled filesystem path is read.
+VVC Office is implemented as one private workspace. The Rust/Axum service is the only web root: it serves the public login page directly and serves every private HTML/CSS/JavaScript asset through explicit authenticated routes. `backend/project/` is never mounted as a static directory and no request-controlled filesystem path is read.
 
 The first runnable slice uses a process-local repository so Preview and automated tests work without external credentials. The production boundary is documented and migration-ready: PostgreSQL/Supabase owns durable users, roles, sessions, operational logs, and audit records; Redis owns distributed rate-limit counters and short-lived abuse state. The migration schema, environment contract, Cloudflare Worker, and native Rust Render configuration are included under `backend/`.
 
@@ -35,5 +35,5 @@ Three candidate styles were considered: **Quiet security console** (0.07), **Edi
 - **Typography System:** system UI stack for compact controls and data, with a heavier geometric display weight for headings; hierarchy comes from size, weight, and tracking rather than many colors.
 - **Brand Essence:** private operational control for teams who need clarity over spectacle; precise, calm, accountable.
 - **Brand Voice:** short, direct, operational. Example lines: “Access is explicit.” and “Operational logs can be cleared; security history cannot.”
-- **Wordmark & Logo:** the AegisCore wordmark is paired with a shield-shaped A monogram constructed from two opposing chevrons.
-- **Signature Brand Color:** Aegis Mint `#7EF2C2`.
+- **Wordmark & Logo:** the VVC Office wordmark is paired with a shield-shaped A monogram constructed from two opposing chevrons.
+- **Signature Brand Color:** VVC Mint `#7EF2C2`.

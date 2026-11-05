@@ -1,4 +1,4 @@
-name = "aegiscore-gateway"
+name = "vvcoffice-gateway"
 main = "index.js"
 compatibility_date = "2026-11-03"
 

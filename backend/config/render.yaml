@@ -1,10 +1,10 @@
 services:
   - type: web
-    name: aegiscore
+    name: vvcoffice
     runtime: rust
     rootDir: backend
     buildCommand: cargo build --release
-    startCommand: ./target/release/aegiscore
+    startCommand: ./target/release/vvcoffice
     healthCheckPath: /healthz
     envVars:
       - key: APP_ENV

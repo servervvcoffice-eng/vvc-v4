@@ -1,4 +1,4 @@
-# AegisCore delivery checklist
+# VVC Office delivery checklist
 
 ## Current state
 
@@ -21,7 +21,7 @@ The route boundary, protected pages/assets, session authentication, CSRF, RBAC, 
 - [ ] Check exact permissions on every protected page and every protected API operation; frontend visibility is not authorization.
 
 ## 4. Admin panel and APIs
-- [ ] Implement responsive AegisCore-branded Dashboard, Users, Views, Activity, and Failed Logins panels with accessible loading, empty, and error states, search, filters, mobile navigation, profile, and sign-out.
+- [ ] Implement responsive VVC Office-branded Dashboard, Users, Views, Activity, and Failed Logins panels with accessible loading, empty, and error states, search, filters, mobile navigation, profile, and sign-out.
 - [ ] Implement authenticated, permission-checked API endpoints for stats, activity, users, roles, views, failed logins, role updates, block/unblock, user deletion, and selected-period operational-log clearing.
 - [ ] Dashboard must show Total Users, Today Views, 7-Day Views, Blocked Users, recent activity, Today/7 Days/30 Days/All filters, and clear only Views/Activity/Failed Login operational logs.
 - [ ] User management must validate username/email/password/role, never return password hashes or sensitive auth data, enforce delegated role changes, revoke sessions on block/delete, and protect the last active Super Admin.

@@ -70,7 +70,7 @@ async fn main() {
             }
         });
     }
-    tracing::info!(environment = %config.app_env, "AegisCore configuration loaded");
+    tracing::info!(environment = %config.app_env, "VVC Office configuration loaded");
     let app = Router::new()
         .route("/", get(handlers::root))
         .route("/healthz", get(handlers::healthz))
@@ -147,6 +147,6 @@ async fn main() {
     let listener = TcpListener::bind(config.bind_addr)
         .await
         .expect("bind server");
-    tracing::info!(address = %config.bind_addr, "AegisCore listening");
+    tracing::info!(address = %config.bind_addr, "VVC Office listening");
     axum::serve(listener, app).await.expect("server failure");
 }

@@ -1,6 +1,6 @@
-# AegisCore
+# VVC Office
 
-AegisCore is a private, single-project workspace implemented as a Rust/Axum service. The public login page is available at `/login`; `/home`, `/about`, `/admin`, and all private assets are served only after server-side authentication and explicit permission checks. `project/` is a private page workspace, not a public static web root. Built-in pages keep their explicit handlers, while new page folders are discovered automatically at runtime.
+VVC Office is a private, single-project workspace implemented as a Rust/Axum service. The public login page is available at `/login`; `/home`, `/about`, `/admin`, and all private assets are served only after server-side authentication and explicit permission checks. `project/` is a private page workspace, not a public static web root. Built-in pages keep their explicit handlers, while new page folders are discovered automatically at runtime.
 
 Unknown paths such as `/unknown` and `/unknown/hello` return the supplied frosted-glass 404 page with a Home link. An authenticated account without `admin.dashboard.read` also receives that same 404 page for `/admin`, avoiding disclosure of the Admin route.
 

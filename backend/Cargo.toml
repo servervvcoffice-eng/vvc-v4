@@ -1,8 +1,8 @@
 [package]
-name = "aegiscore"
+name = "vvcoffice"
 version = "0.1.0"
 edition = "2021"
-description = "Private single-project AegisCore workspace"
+description = "Private single-project VVC Office workspace"
 license = "MIT"
 
 [dependencies]
