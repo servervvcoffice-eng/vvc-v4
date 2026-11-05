@@ -221,6 +221,44 @@ impl Persistence {
         Ok(store.users.len())
     }
 
+    /// Creates the initial superadmin exactly once. The advisory transaction lock
+    /// prevents two booting instances from racing; an existing user means the
+    /// bootstrap is permanently skipped.
+    pub async fn bootstrap_superadmin(
+        &self,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("select pg_advisory_xact_lock(hashtext('vvc-office-bootstrap'))")
+            .persistent(false)
+            .execute(&mut *tx)
+            .await?;
+        let existing: i64 = sqlx::query_scalar("select count(*) from users")
+            .persistent(false)
+            .fetch_one(&mut *tx)
+            .await?;
+        if existing > 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let user_id: uuid::Uuid = sqlx::query_scalar(
+            "insert into users (username, email, password_hash) values ('superadmin', $1, $2) returning id",
+        )
+        .persistent(false)
+        .bind(email)
+        .bind(password_hash)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query("insert into user_roles (user_id, role_id) values ($1, 'super_admin')")
+            .persistent(false)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn sync_users(&self, store: &Store) -> Result<(), sqlx::Error> {
         for user in store.users.values() {
             if uuid::Uuid::parse_str(&user.id).is_err() {

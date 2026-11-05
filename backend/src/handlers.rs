@@ -103,6 +103,21 @@ pub async fn healthz() -> impl IntoResponse {
         "ok",
     )
 }
+pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    if state.persistence.is_some() {
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "ready",
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "persistence unavailable",
+        )
+    }
+}
 pub async fn not_found() -> Response {
     (
         StatusCode::NOT_FOUND,

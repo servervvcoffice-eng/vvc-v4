@@ -3,6 +3,7 @@ mod handlers;
 mod security;
 mod store;
 
+use axum::http::{header, HeaderName, HeaderValue, Method};
 use axum::{
     extract::DefaultBodyLimit,
     middleware,
@@ -14,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use store::{AppState, Store};
 use tokio::net::TcpListener;
-use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
 #[tokio::main]
 async fn main() {
@@ -22,7 +23,13 @@ async fn main() {
         .json()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let config = Config::from_env();
+    let config = match Config::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(error = %error.0, "invalid runtime configuration");
+            std::process::exit(78);
+        }
+    };
     if config.is_production() {
         tracing::error!("production startup refused: this build uses the Preview in-memory repository; wire the durable Supabase/Redis adapters, gateway secret, and one-time bootstrap flow before production");
         std::process::exit(78);
@@ -46,6 +53,10 @@ async fn main() {
     if let Some(persistence) = &persistence {
         match persistence.load_users(&mut initial_store).await {
             Ok(count) if count > 0 => tracing::info!(users = count, "Loaded users from Supabase"),
+            Ok(_) if config.is_production() => {
+                tracing::error!("Supabase users table is empty; production bootstrap must be completed transactionally");
+                std::process::exit(78);
+            }
             Ok(_) => tracing::warn!("Supabase users table is empty; retaining development seed"),
             Err(error) => {
                 tracing::error!(%error, "Could not load users from Supabase");
@@ -74,6 +85,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(handlers::root))
         .route("/healthz", get(handlers::healthz))
+        .route("/readyz", get(handlers::readyz))
         .route("/health", get(handlers::healthz))
         .route("/manus-routes.json", get(handlers::routes_manifest))
         .route("/login", get(handlers::login_page).post(handlers::login))
@@ -137,6 +149,23 @@ async fn main() {
         .fallback(handlers::dynamic_route)
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(config.max_body_bytes))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(HeaderValue::from_static(config::ALLOWED_ORIGIN))
+                .allow_credentials(true)
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers([
+                    header::CONTENT_TYPE,
+                    HeaderName::from_static("x-csrf-token"),
+                    HeaderName::from_static("x-vvc-gateway"),
+                ]),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             handlers::gateway_guard,
