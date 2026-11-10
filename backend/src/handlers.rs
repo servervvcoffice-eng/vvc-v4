@@ -104,7 +104,7 @@ pub async fn healthz() -> impl IntoResponse {
     )
 }
 pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    if state.persistence.is_some() {
+    if state.persistence.is_some() && state.login_limiter.ready().await {
         (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -198,48 +198,57 @@ pub async fn login(
     {
         return json_error(StatusCode::UNAUTHORIZED, "Invalid username or password");
     }
-    let mut db = state.pub_store.write().await;
     let now = store::now();
-    let throttled = {
-        let bucket = db
-            .login_buckets
-            .entry(ip.clone())
-            .or_insert(store::LoginBucket {
-                window_started: now,
-                attempts: 0,
-            });
-        if now.saturating_sub(bucket.window_started) > 60 {
-            bucket.window_started = now;
-            bucket.attempts = 0;
+    let throttled = match state.login_limiter.is_throttled(&ip).await {
+        Ok(throttled) => throttled,
+        Err(error) => {
+            tracing::error!(%error, "login rate limiter check failed");
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Login temporarily unavailable",
+            );
         }
-        bucket.attempts >= 8
     };
     if throttled {
+        let mut db = state.pub_store.write().await;
         db.add_failed(&username, &ip, &device);
         return json_error(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many attempts. Try again later.",
         );
     }
-    let found = db.user_by_username(&username);
+    let found = state.pub_store.read().await.user_by_username(&username);
     let valid = found
         .as_ref()
         .map(|u| !u.blocked && security::verify_password(&payload.password, &u.password_hash))
         .unwrap_or(false);
     if !valid {
-        if let Some(bucket) = db.login_buckets.get_mut(&ip) {
-            bucket.attempts += 1;
-        }
+        let rate_error = state.login_limiter.record_failure(&ip).await.err();
+        let mut db = state.pub_store.write().await;
         db.add_failed(&username, &ip, &device);
         if let Some(user) = found {
             if let Some(stored) = db.users.get_mut(&user.id) {
                 stored.failed_login_count = stored.failed_login_count.saturating_add(1);
             }
         }
+        if let Some(error) = rate_error {
+            tracing::error!(%error, "login rate limiter record failed");
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Login temporarily unavailable",
+            );
+        }
         return json_error(StatusCode::UNAUTHORIZED, "Invalid username or password");
     }
     let user = found.expect("valid login has user");
-    db.login_buckets.remove(&ip);
+    if let Err(error) = state.login_limiter.clear(&ip).await {
+        tracing::error!(%error, "login rate limiter clear failed");
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Login temporarily unavailable",
+        );
+    }
+    let mut db = state.pub_store.write().await;
     db.sessions.retain(|_, session| session.user_id != user.id);
     let session_id = security::random_token(32);
     let csrf_token = security::random_token(24);

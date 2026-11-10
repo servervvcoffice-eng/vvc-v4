@@ -1,5 +1,6 @@
 mod config;
 mod handlers;
+mod rate_limit;
 mod security;
 mod store;
 
@@ -30,10 +31,27 @@ async fn main() {
             std::process::exit(78);
         }
     };
-    if config.is_production() {
-        tracing::error!("production startup refused: this build uses the Preview in-memory repository; wire the durable Supabase/Redis adapters, gateway secret, and one-time bootstrap flow before production");
-        std::process::exit(78);
-    }
+    let login_limiter = match rate_limit::LoginRateLimiter::connect(
+        config.redis_url.as_deref(),
+        config.is_production(),
+    )
+    .await
+    {
+        Ok(limiter) => {
+            if config.redis_url.is_some() {
+                tracing::info!("Redis login rate limiter connected");
+            } else {
+                tracing::warn!(
+                    "REDIS_URL is not configured; using process-local preview login limiter"
+                );
+            }
+            limiter
+        }
+        Err(error) => {
+            tracing::error!(%error, "Redis login rate limiter startup check failed");
+            std::process::exit(78);
+        }
+    };
     let persistence = if let Some(database_url) = &config.database_url {
         match store::Persistence::connect(database_url).await {
             Ok(persistence) => {
@@ -68,6 +86,7 @@ async fn main() {
         pub_store: Arc::new(tokio::sync::RwLock::new(initial_store)),
         config: config.clone(),
         persistence,
+        login_limiter,
     };
     if let Some(persistence) = state.persistence.clone() {
         let sync_store = state.pub_store.clone();

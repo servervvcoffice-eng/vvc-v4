@@ -1,4 +1,4 @@
-use crate::{config::Config, security};
+use crate::{config::Config, rate_limit::LoginRateLimiter, security};
 use serde::{Deserialize, Serialize};
 use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
@@ -127,12 +127,6 @@ pub struct SpamLog {
     pub status: u16,
     pub timestamp: u64,
 }
-#[derive(Clone, Debug)]
-pub struct LoginBucket {
-    pub window_started: u64,
-    pub attempts: u32,
-}
-
 pub struct Store {
     pub users: HashMap<String, User>,
     pub sessions: HashMap<String, Session>,
@@ -141,7 +135,6 @@ pub struct Store {
     pub failed_logins: Vec<FailedLogin>,
     pub audits: Vec<AuditLog>,
     pub spam: Vec<SpamLog>,
-    pub login_buckets: HashMap<String, LoginBucket>,
 }
 
 #[derive(Clone)]
@@ -149,6 +142,7 @@ pub struct AppState {
     pub pub_store: Arc<RwLock<Store>>,
     pub config: Config,
     pub persistence: Option<Arc<Persistence>>,
+    pub login_limiter: LoginRateLimiter,
 }
 
 #[derive(Clone)]
@@ -358,7 +352,6 @@ impl Store {
             failed_logins: Vec::new(),
             audits: Vec::new(),
             spam: Vec::new(),
-            login_buckets: HashMap::new(),
         }
     }
 
