@@ -88,17 +88,11 @@ async fn main() {
         persistence,
         login_limiter,
     };
-    if let Some(persistence) = state.persistence.clone() {
-        let sync_store = state.pub_store.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                let db = sync_store.read().await;
-                if let Err(error) = persistence.sync_users(&db).await {
-                    tracing::error!(%error, "Supabase user sync failed");
-                }
-            }
-        });
+    if config.is_production() {
+        tracing::error!(
+            "production startup is disabled until operational and security log handlers are fully PostgreSQL-backed"
+        );
+        std::process::exit(78);
     }
     tracing::info!(environment = %config.app_env, "VVC Office configuration loaded");
     let app = Router::new()

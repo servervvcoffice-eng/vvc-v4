@@ -290,6 +290,88 @@ impl Persistence {
         }
         Ok(())
     }
+
+    pub async fn create_session(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        csrf_token: &str,
+        now: u64,
+        expires_at: u64,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("delete from sessions where user_id = $1::uuid")
+            .persistent(false)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "insert into sessions (id_hash, user_id, csrf_token_hash, created_at, last_seen_at, expires_at)
+             values ($1, $2::uuid, $3, to_timestamp($4), to_timestamp($4), to_timestamp($5))",
+        )
+        .persistent(false)
+        .bind(security::hash_session_token(session_id))
+        .bind(user_id)
+        .bind(security::hash_session_token(csrf_token))
+        .bind(now as i64)
+        .bind(expires_at as i64)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await
+    }
+
+    pub async fn session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, String, u64, u64, u64)>, sqlx::Error> {
+        let row = sqlx::query(
+            "select user_id::text as user_id, csrf_token_hash,
+                    floor(extract(epoch from created_at))::bigint as created_at,
+                    floor(extract(epoch from last_seen_at))::bigint as last_seen_at,
+                    floor(extract(epoch from expires_at))::bigint as expires_at
+             from sessions where id_hash = $1",
+        )
+        .persistent(false)
+        .bind(security::hash_session_token(session_id))
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        Ok(Some((
+            row.try_get("user_id")?,
+            row.try_get("csrf_token_hash")?,
+            row.try_get::<i64, _>("created_at")?.max(0) as u64,
+            row.try_get::<i64, _>("last_seen_at")?.max(0) as u64,
+            row.try_get::<i64, _>("expires_at")?.max(0) as u64,
+        )))
+    }
+
+    pub async fn touch_session(&self, session_id: &str, now: u64) -> Result<(), sqlx::Error> {
+        sqlx::query("update sessions set last_seen_at = to_timestamp($2) where id_hash = $1")
+            .persistent(false)
+            .bind(security::hash_session_token(session_id))
+            .bind(now as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn revoke_session(&self, session_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("delete from sessions where id_hash = $1")
+            .persistent(false)
+            .bind(security::hash_session_token(session_id))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn revoke_user_sessions(&self, user_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("delete from sessions where user_id = $1::uuid")
+            .persistent(false)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 fn permissions_for_role(role: &Role) -> HashSet<String> {

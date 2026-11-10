@@ -32,6 +32,13 @@ pub fn random_token(bytes: usize) -> String {
     URL_SAFE_NO_PAD.encode(buf)
 }
 
+pub fn hash_session_token(token: &str) -> String {
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
     raw.split(';').find_map(|part| {
@@ -95,10 +102,24 @@ pub fn session_cookie(token: &str, max_age: u64, secure: bool) -> String {
         format!("vvc_session={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax")
     }
 }
+pub fn csrf_cookie(token: &str, max_age: u64, secure: bool) -> String {
+    if secure {
+        format!("vvc_csrf={token}; Path=/; Max-Age={max_age}; Secure; SameSite=None")
+    } else {
+        format!("vvc_csrf={token}; Path=/; Max-Age={max_age}; SameSite=Lax")
+    }
+}
 pub fn expired_session_cookie(secure: bool) -> String {
     if secure {
         "vvc_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None".into()
     } else {
         "vvc_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax".into()
+    }
+}
+pub fn expired_csrf_cookie(secure: bool) -> String {
+    if secure {
+        "vvc_csrf=; Path=/; Max-Age=0; Secure; SameSite=None".into()
+    } else {
+        "vvc_csrf=; Path=/; Max-Age=0; SameSite=Lax".into()
     }
 }

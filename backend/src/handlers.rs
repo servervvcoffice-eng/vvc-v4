@@ -252,13 +252,31 @@ pub async fn login(
     db.sessions.retain(|_, session| session.user_id != user.id);
     let session_id = security::random_token(32);
     let csrf_token = security::random_token(24);
+    if let Some(persistence) = &state.persistence {
+        if let Err(error) = persistence
+            .create_session(
+                &session_id,
+                &user.id,
+                &csrf_token,
+                now,
+                now.saturating_add(state.config.session_absolute_secs),
+            )
+            .await
+        {
+            tracing::error!(%error, "durable session creation failed");
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Login temporarily unavailable",
+            );
+        }
+    }
     db.sessions.insert(
         session_id.clone(),
         store::Session {
             user_id: user.id.clone(),
             created_at: now,
             last_seen: now,
-            csrf_token,
+            csrf_token: csrf_token.clone(),
         },
     );
     if let Some(stored) = db.users.get_mut(&user.id) {
@@ -283,35 +301,65 @@ pub async fn login(
         ))
         .unwrap(),
     );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&security::csrf_cookie(
+            &csrf_token,
+            state.config.session_absolute_secs,
+            state.config.cookie_secure,
+        ))
+        .unwrap(),
+    );
     response
 }
 
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let token = security::cookie_value(&headers, "vvc_session");
     let Some(token) = token else {
-        return (
-            StatusCode::NO_CONTENT,
-            [(
-                header::SET_COOKIE,
-                security::expired_session_cookie(state.config.cookie_secure),
-            )],
-        )
-            .into_response();
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&security::expired_session_cookie(
+                state.config.cookie_secure,
+            ))
+            .unwrap(),
+        );
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&security::expired_csrf_cookie(state.config.cookie_secure))
+                .unwrap(),
+        );
+        return response;
     };
     let Some(ctx) = auth_context(&state, &headers).await else {
-        return (
-            StatusCode::NO_CONTENT,
-            [(
-                header::SET_COOKIE,
-                security::expired_session_cookie(state.config.cookie_secure),
-            )],
-        )
-            .into_response();
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&security::expired_session_cookie(
+                state.config.cookie_secure,
+            ))
+            .unwrap(),
+        );
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&security::expired_csrf_cookie(state.config.cookie_secure))
+                .unwrap(),
+        );
+        return response;
     };
     if !csrf_valid(&headers, &ctx) {
         return json_error(StatusCode::FORBIDDEN, "CSRF validation failed");
     }
     let ip = security::client_ip(&headers);
+    if let Some(persistence) = &state.persistence {
+        if let Err(error) = persistence.revoke_session(&token).await {
+            tracing::error!(%error, "durable session revocation failed");
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Logout temporarily unavailable",
+            );
+        }
+    }
     let mut db = state.pub_store.write().await;
     db.sessions.remove(&token);
     db.add_activity(&ctx.user.username, "logout", "Session revoked", &ip);
@@ -321,14 +369,19 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
         "User logged out",
         &ip,
     );
-    (
-        StatusCode::NO_CONTENT,
-        [(
-            header::SET_COOKIE,
-            security::expired_session_cookie(state.config.cookie_secure),
-        )],
-    )
-        .into_response()
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&security::expired_session_cookie(
+            state.config.cookie_secure,
+        ))
+        .unwrap(),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&security::expired_csrf_cookie(state.config.cookie_secure)).unwrap(),
+    );
+    response
 }
 
 pub async fn home_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1292,6 +1345,41 @@ pub async fn security_headers(request: Request<axum::body::Body>, next: Next) ->
 
 async fn auth_context(state: &AppState, headers: &HeaderMap) -> Option<AuthContext> {
     let token = security::cookie_value(headers, "vvc_session")?;
+    if let Some(persistence) = &state.persistence {
+        let now = store::now();
+        let record = match persistence.session(&token).await {
+            Ok(record) => record?,
+            Err(error) => {
+                tracing::error!(%error, "durable session lookup failed");
+                return None;
+            }
+        };
+        let (user_id, csrf_hash, _created_at, last_seen, expires_at) = record;
+        if now >= expires_at || now.saturating_sub(last_seen) > state.config.session_idle_secs {
+            let _ = persistence.revoke_session(&token).await;
+            return None;
+        }
+        let (user, csrf_token) = {
+            let db = state.pub_store.read().await;
+            let user = db.user(&user_id)?;
+            let csrf_token = security::cookie_value(headers, "vvc_csrf").filter(|value| {
+                security::constant_time_equal(&security::hash_session_token(value), &csrf_hash)
+            });
+            let Some(csrf_token) = csrf_token else {
+                return None;
+            };
+            (user, csrf_token)
+        };
+        if user.blocked {
+            let _ = persistence.revoke_session(&token).await;
+            return None;
+        }
+        if let Err(error) = persistence.touch_session(&token, now).await {
+            tracing::error!(%error, "durable session touch failed");
+            return None;
+        }
+        return Some(AuthContext { user, csrf_token });
+    }
     let mut db = state.pub_store.write().await;
     let now = store::now();
     let session = db.sessions.get(&token).cloned()?;
