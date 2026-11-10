@@ -212,6 +212,8 @@ pub async fn login(
     if throttled {
         let mut db = state.pub_store.write().await;
         db.add_failed(&username, &ip, &device);
+        drop(db);
+        persist_failed(&state, &username, &ip, &device).await;
         return json_error(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many attempts. Try again later.",
@@ -231,6 +233,8 @@ pub async fn login(
                 stored.failed_login_count = stored.failed_login_count.saturating_add(1);
             }
         }
+        drop(db);
+        persist_failed(&state, &username, &ip, &device).await;
         if let Some(error) = rate_error {
             tracing::error!(%error, "login rate limiter record failed");
             return json_error(
@@ -290,6 +294,25 @@ pub async fn login(
         "Authenticated session created",
         &ip,
     );
+    drop(db);
+    persist_activity(
+        &state,
+        Some(&user.id),
+        &user.username,
+        "login",
+        "Successful sign in",
+        &ip,
+    )
+    .await;
+    persist_audit(
+        &state,
+        Some(&user.id),
+        &user.username,
+        "session.created",
+        "Authenticated session created",
+        &ip,
+    )
+    .await;
     let mut response =
         Json(json!({"ok": true, "redirect": "/home", "message": "Signed in"})).into_response();
     response.headers_mut().insert(
@@ -618,6 +641,16 @@ pub async fn dynamic_route(
     let device = security::device(&headers);
     let mut db = state.pub_store.write().await;
     db.add_view(&page, &ctx.user.username, &ip, &device);
+    drop(db);
+    persist_view(
+        &state,
+        &page,
+        Some(&ctx.user.id),
+        &ctx.user.username,
+        &ip,
+        &device,
+    )
+    .await;
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -643,6 +676,16 @@ async fn protected_page(
     let device = security::device(headers);
     let mut db = state.pub_store.write().await;
     db.add_view(page, &ctx.user.username, &ip, &device);
+    drop(db);
+    persist_view(
+        &state,
+        page,
+        Some(&ctx.user.id),
+        &ctx.user.username,
+        &ip,
+        &device,
+    )
+    .await;
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -701,10 +744,21 @@ pub async fn admin_stats(
     let Some(ctx) = api_context(&state, &headers, Some("admin.dashboard.read")).await else {
         return json_error(StatusCode::FORBIDDEN, "Permission required");
     };
-    let db = state.pub_store.read().await;
     let start = range_start(query.range.as_deref());
     let today = range_start(Some("today"));
     let seven = range_start(Some("7d"));
+    if let Some(persistence) = &state.persistence {
+        let recent_activity = persistence
+            .activity(start, "", 0, 8)
+            .await
+            .unwrap_or_default();
+        let today_views = persistence.count_since("views", today).await.unwrap_or(0);
+        let seven_day_views = persistence.count_since("views", seven).await.unwrap_or(0);
+        let today_spam = persistence.count_since("spam", today).await.unwrap_or(0);
+        let db = state.pub_store.read().await;
+        return Json(json!({"total_users": db.users.len(), "today_views": today_views, "seven_day_views": seven_day_views, "blocked_users": db.users.values().filter(|u| u.blocked).count(), "today_spam": today_spam, "recent_activity": recent_activity})).into_response();
+    }
+    let db = state.pub_store.read().await;
     let total_users = db.users.len();
     let blocked_users = db.users.values().filter(|u| u.blocked).count();
     let today_views = db
@@ -745,9 +799,29 @@ pub async fn admin_activity(
     {
         return json_error(StatusCode::FORBIDDEN, "Permission required");
     }
-    let db = state.pub_store.read().await;
     let start = range_start(query.range.as_deref());
     let search = query.search.as_deref().unwrap_or("").to_lowercase();
+    if let Some(persistence) = &state.persistence {
+        let limit = query.limit.unwrap_or(25).clamp(1, 100);
+        let page = query.page.unwrap_or(1).clamp(1, 10_000);
+        let items = persistence
+            .activity(start, &search, page - 1, limit)
+            .await
+            .unwrap_or_default();
+        let total = persistence
+            .count_since("activity", start)
+            .await
+            .unwrap_or(0)
+            .max(0) as usize;
+        return Json(Paged {
+            items,
+            total,
+            page,
+            limit,
+        })
+        .into_response();
+    }
+    let db = state.pub_store.read().await;
     let items: Vec<_> = db
         .activity
         .iter()
@@ -1050,9 +1124,29 @@ pub async fn admin_views(
     {
         return json_error(StatusCode::FORBIDDEN, "Permission required");
     }
-    let db = state.pub_store.read().await;
     let start = range_start(query.range.as_deref());
     let page_name = query.page_name.as_deref().unwrap_or("").to_lowercase();
+    if let Some(persistence) = &state.persistence {
+        let limit = query.limit.unwrap_or(25).clamp(1, 100);
+        let page = query.page.unwrap_or(1).clamp(1, 10_000);
+        let items = persistence
+            .views(start, &page_name, page - 1, limit)
+            .await
+            .unwrap_or_default();
+        let total = persistence
+            .count_since("views", start)
+            .await
+            .unwrap_or(0)
+            .max(0) as usize;
+        return Json(Paged {
+            items,
+            total,
+            page,
+            limit,
+        })
+        .into_response();
+    }
+    let db = state.pub_store.read().await;
     let items: Vec<ViewLog> = db
         .views
         .iter()
@@ -1075,8 +1169,28 @@ pub async fn admin_failed_logins(
     {
         return json_error(StatusCode::FORBIDDEN, "Permission required");
     }
-    let db = state.pub_store.read().await;
     let start = range_start(query.range.as_deref());
+    if let Some(persistence) = &state.persistence {
+        let limit = query.limit.unwrap_or(25).clamp(1, 100);
+        let page = query.page.unwrap_or(1).clamp(1, 10_000);
+        let items = persistence
+            .failed_logins(start, page - 1, limit)
+            .await
+            .unwrap_or_default();
+        let total = persistence
+            .count_since("failed", start)
+            .await
+            .unwrap_or(0)
+            .max(0) as usize;
+        return Json(Paged {
+            items,
+            total,
+            page,
+            limit,
+        })
+        .into_response();
+    }
+    let db = state.pub_store.read().await;
     let items: Vec<FailedLogin> = db
         .failed_logins
         .iter()
@@ -1098,9 +1212,29 @@ pub async fn admin_spam(
     {
         return json_error(StatusCode::FORBIDDEN, "Permission required");
     }
-    let db = state.pub_store.read().await;
     let start = range_start(query.range.as_deref());
     let search = query.search.as_deref().unwrap_or("").to_lowercase();
+    if let Some(persistence) = &state.persistence {
+        let limit = query.limit.unwrap_or(25).clamp(1, 100);
+        let page = query.page.unwrap_or(1).clamp(1, 10_000);
+        let items = persistence
+            .spam(start, &search, page - 1, limit)
+            .await
+            .unwrap_or_default();
+        let total = persistence
+            .count_since("spam", start)
+            .await
+            .unwrap_or(0)
+            .max(0) as usize;
+        return Json(Paged {
+            items,
+            total,
+            page,
+            limit,
+        })
+        .into_response();
+    }
+    let db = state.pub_store.read().await;
     let items: Vec<_> = db
         .spam
         .iter()
@@ -1136,8 +1270,23 @@ pub async fn admin_audit_logs(
     {
         return json_error(StatusCode::FORBIDDEN, "Permission required");
     }
-    let db = state.pub_store.read().await;
     let start = range_start(query.range.as_deref());
+    if let Some(persistence) = &state.persistence {
+        let limit = query.limit.unwrap_or(25).clamp(1, 100);
+        let page = query.page.unwrap_or(1).clamp(1, 10_000);
+        let items = persistence
+            .audits(start, page - 1, limit)
+            .await
+            .unwrap_or_default();
+        return Json(Paged {
+            total: items.len(),
+            items,
+            page,
+            limit,
+        })
+        .into_response();
+    }
+    let db = state.pub_store.read().await;
     let items: Vec<AuditLog> = db
         .audits
         .iter()
@@ -1213,12 +1362,32 @@ async fn clear_operational(
             .failed_logins
             .retain(|item| start.map(|s| item.timestamp < s).unwrap_or(false)),
     }
+    let audit_details = format!("Cleared {kind} for {range}; security audit records retained");
+    let audit_ip = security::client_ip(headers);
     db.add_audit(
         &ctx.user.username,
         "operational_logs.cleared",
-        &format!("Cleared {kind} for {range}; security audit records retained"),
-        &security::client_ip(headers),
+        &audit_details,
+        &audit_ip,
     );
+    drop(db);
+    if let Some(persistence) = &state.persistence {
+        if let Err(error) = persistence.clear_logs(kind, start).await {
+            tracing::error!(%error, "durable operational log clear failed");
+        }
+        if let Err(error) = persistence
+            .record_audit(
+                Some(&ctx.user.id),
+                &ctx.user.username,
+                "operational_logs.cleared",
+                &audit_details,
+                &audit_ip,
+            )
+            .await
+        {
+            tracing::error!(%error, "durable clear audit failed");
+        }
+    }
     Json(json!({"ok": true, "cleared": kind, "range": range})).into_response()
 }
 
@@ -1308,6 +1477,19 @@ async fn record_spam(
         method,
         status,
     );
+    drop(db);
+    persist_spam(
+        &state,
+        &username,
+        ip,
+        fingerprint,
+        model,
+        device,
+        route,
+        method,
+        status,
+    )
+    .await;
 }
 
 pub async fn security_headers(request: Request<axum::body::Body>, next: Next) -> Response {
@@ -1433,6 +1615,94 @@ fn safe_forbidden_page() -> Response {
 fn json_error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({"error": message}))).into_response()
 }
+async fn persist_activity(
+    state: &AppState,
+    user_id: Option<&str>,
+    username: &str,
+    action: &str,
+    details: &str,
+    ip: &str,
+) {
+    if let Some(persistence) = &state.persistence {
+        if let Err(error) = persistence
+            .record_activity(user_id, username, action, details, ip)
+            .await
+        {
+            tracing::error!(%error, "durable activity log write failed");
+        }
+    }
+}
+async fn persist_audit(
+    state: &AppState,
+    actor_id: Option<&str>,
+    actor: &str,
+    action: &str,
+    details: &str,
+    ip: &str,
+) {
+    if let Some(persistence) = &state.persistence {
+        if let Err(error) = persistence
+            .record_audit(actor_id, actor, action, details, ip)
+            .await
+        {
+            tracing::error!(%error, "durable audit log write failed");
+        }
+    }
+}
+async fn persist_failed(state: &AppState, username: &str, ip: &str, device: &str) {
+    if let Some(persistence) = &state.persistence {
+        if let Err(error) = persistence.record_failed_login(username, ip, device).await {
+            tracing::error!(%error, "durable failed login write failed");
+        }
+    }
+}
+async fn persist_view(
+    state: &AppState,
+    page: &str,
+    user_id: Option<&str>,
+    username: &str,
+    ip: &str,
+    device: &str,
+) {
+    if let Some(persistence) = &state.persistence {
+        if let Err(error) = persistence
+            .record_view(page, user_id, username, ip, device)
+            .await
+        {
+            tracing::error!(%error, "durable view log write failed");
+        }
+    }
+}
+async fn persist_spam(
+    state: &AppState,
+    username: &str,
+    ip: &str,
+    fingerprint: &str,
+    model: &str,
+    device: &str,
+    route: &str,
+    method: &str,
+    status: u16,
+) {
+    if let Some(persistence) = &state.persistence {
+        if let Err(error) = persistence
+            .record_spam(
+                username,
+                ip,
+                fingerprint,
+                model,
+                device,
+                route,
+                method,
+                status,
+            )
+            .await
+        {
+            tracing::error!(%error, "durable spam log write failed");
+        }
+    }
+}
+
 fn summary(u: &User) -> UserSummary {
     UserSummary {
         id: u.id.clone(),

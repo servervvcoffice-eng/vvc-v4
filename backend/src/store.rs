@@ -372,6 +372,228 @@ impl Persistence {
             .await?;
         Ok(())
     }
+
+    fn uuid_value(value: Option<&str>) -> Option<String> {
+        value
+            .filter(|value| uuid::Uuid::parse_str(value).is_ok())
+            .map(str::to_owned)
+    }
+
+    pub async fn record_activity(
+        &self,
+        user_id: Option<&str>,
+        username: &str,
+        action: &str,
+        details: &str,
+        ip: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("insert into activity_logs (user_id, username_snapshot, action, details, ip_address) values ($1::uuid, $2, $3, $4, nullif($5, '')::inet)")
+            .persistent(false)
+            .bind(Self::uuid_value(user_id))
+            .bind(username).bind(action).bind(details).bind(ip)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn record_view(
+        &self,
+        page: &str,
+        user_id: Option<&str>,
+        username: &str,
+        ip: &str,
+        device: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("insert into view_logs (page, user_id, username_snapshot, ip_address, device_info) values ($1, $2::uuid, $3, nullif($4, '')::inet, $5)")
+            .persistent(false).bind(page).bind(Self::uuid_value(user_id)).bind(username)
+            .bind(ip).bind(device).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn record_failed_login(
+        &self,
+        username: &str,
+        ip: &str,
+        device: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("insert into login_attempts (attempted_username, ip_address, device_info, succeeded) values ($1, nullif($2, '')::inet, $3, false)")
+            .persistent(false).bind(username).bind(ip).bind(device).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn record_audit(
+        &self,
+        actor_id: Option<&str>,
+        actor: &str,
+        action: &str,
+        details: &str,
+        ip: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("insert into audit_logs (actor_user_id, action, details, ip_address) values ($1::uuid, $2, jsonb_build_object('actor', $3, 'message', $4), nullif($5, '')::inet)")
+            .persistent(false).bind(Self::uuid_value(actor_id)).bind(action).bind(actor)
+            .bind(details).bind(ip).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_spam(
+        &self,
+        username: &str,
+        ip: &str,
+        fingerprint: &str,
+        model: &str,
+        device: &str,
+        route: &str,
+        method: &str,
+        status: u16,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("insert into spam_logs (username_snapshot, ip_address, device_fingerprint, device_model, device_info, route, method, status_code) values ($1, nullif($2, '')::inet, $3, $4, $5, $6, $7, $8)")
+            .persistent(false).bind(username).bind(ip).bind(fingerprint).bind(model).bind(device)
+            .bind(route).bind(method).bind(status as i32).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn activity(
+        &self,
+        start: Option<u64>,
+        search: &str,
+        page: usize,
+        limit: usize,
+    ) -> Result<Vec<ActivityLog>, sqlx::Error> {
+        let rows = sqlx::query("select id::text as id, username_snapshot as username, action, details, coalesce(host(ip_address), '') as ip, floor(extract(epoch from created_at))::bigint as timestamp from activity_logs where ($1::bigint is null or extract(epoch from created_at) >= $1) and ($2 = '' or lower(username_snapshot || ' ' || action || ' ' || details) like '%' || lower($2) || '%') order by created_at desc limit $3 offset $4")
+            .persistent(false).bind(start.map(|v| v as i64)).bind(search).bind(limit as i64).bind((page * limit) as i64).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ActivityLog {
+                    id: row.try_get("id")?,
+                    user: row.try_get("username")?,
+                    action: row.try_get("action")?,
+                    details: row.try_get("details")?,
+                    ip: row.try_get("ip")?,
+                    timestamp: row.try_get::<i64, _>("timestamp")?.max(0) as u64,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn views(
+        &self,
+        start: Option<u64>,
+        page_name: &str,
+        page: usize,
+        limit: usize,
+    ) -> Result<Vec<ViewLog>, sqlx::Error> {
+        let rows = sqlx::query("select id::text as id, page, username_snapshot as username, coalesce(host(ip_address), '') as ip, coalesce(device_info, '') as device, floor(extract(epoch from created_at))::bigint as timestamp from view_logs where ($1::bigint is null or extract(epoch from created_at) >= $1) and ($2 = '' or lower(page) = lower($2)) order by created_at desc limit $3 offset $4")
+            .persistent(false).bind(start.map(|v| v as i64)).bind(page_name).bind(limit as i64).bind((page * limit) as i64).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ViewLog {
+                    id: row.try_get("id")?,
+                    page: row.try_get("page")?,
+                    user: row.try_get("username")?,
+                    ip: row.try_get("ip")?,
+                    device: row.try_get("device")?,
+                    timestamp: row.try_get::<i64, _>("timestamp")?.max(0) as u64,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn failed_logins(
+        &self,
+        start: Option<u64>,
+        page: usize,
+        limit: usize,
+    ) -> Result<Vec<FailedLogin>, sqlx::Error> {
+        let rows = sqlx::query("select id::text as id, attempted_username, coalesce(host(ip_address), '') as ip, coalesce(device_info, '') as device, floor(extract(epoch from created_at))::bigint as timestamp from login_attempts where not succeeded and ($1::bigint is null or extract(epoch from created_at) >= $1) order by created_at desc limit $2 offset $3")
+            .persistent(false).bind(start.map(|v| v as i64)).bind(limit as i64).bind((page * limit) as i64).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(FailedLogin {
+                    id: row.try_get("id")?,
+                    attempted_username: row.try_get("attempted_username")?,
+                    ip: row.try_get("ip")?,
+                    device: row.try_get("device")?,
+                    timestamp: row.try_get::<i64, _>("timestamp")?.max(0) as u64,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn audits(
+        &self,
+        start: Option<u64>,
+        page: usize,
+        limit: usize,
+    ) -> Result<Vec<AuditLog>, sqlx::Error> {
+        let rows = sqlx::query("select id::text as id, coalesce(details->>'actor', 'system') as actor, action, coalesce(details->>'message', details::text) as details, coalesce(host(ip_address), '') as ip, floor(extract(epoch from created_at))::bigint as timestamp from audit_logs where ($1::bigint is null or extract(epoch from created_at) >= $1) order by created_at desc limit $2 offset $3")
+            .persistent(false).bind(start.map(|v| v as i64)).bind(limit as i64).bind((page * limit) as i64).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(AuditLog {
+                    id: row.try_get("id")?,
+                    actor: row.try_get("actor")?,
+                    action: row.try_get("action")?,
+                    details: row.try_get("details")?,
+                    ip: row.try_get("ip")?,
+                    timestamp: row.try_get::<i64, _>("timestamp")?.max(0) as u64,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn spam(
+        &self,
+        start: Option<u64>,
+        search: &str,
+        page: usize,
+        limit: usize,
+    ) -> Result<Vec<SpamLog>, sqlx::Error> {
+        let rows = sqlx::query("select id::text as id, username_snapshot as username, coalesce(host(ip_address), '') as ip, device_fingerprint, coalesce(device_model, '') as device_model, coalesce(device_info, '') as device, route, method, status_code, floor(extract(epoch from created_at))::bigint as timestamp from spam_logs where ($1::bigint is null or extract(epoch from created_at) >= $1) and ($2 = '' or lower(username_snapshot || ' ' || host(ip_address) || ' ' || device_fingerprint || ' ' || coalesce(device_model, '') || ' ' || route || ' ' || method) like '%' || lower($2) || '%') order by created_at desc limit $3 offset $4")
+            .persistent(false).bind(start.map(|v| v as i64)).bind(search).bind(limit as i64).bind((page * limit) as i64).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(SpamLog {
+                    id: row.try_get("id")?,
+                    username: row.try_get("username")?,
+                    ip: row.try_get("ip")?,
+                    device_fingerprint: row.try_get("device_fingerprint")?,
+                    device_model: row.try_get("device_model")?,
+                    device: row.try_get("device")?,
+                    route: row.try_get("route")?,
+                    method: row.try_get("method")?,
+                    status: row
+                        .try_get::<i32, _>("status_code")?
+                        .clamp(0, u16::MAX as i32) as u16,
+                    timestamp: row.try_get::<i64, _>("timestamp")?.max(0) as u64,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn count_since(&self, table: &str, start: Option<u64>) -> Result<i64, sqlx::Error> {
+        let query = match table { "views" => "select count(*) from view_logs where ($1::bigint is null or extract(epoch from created_at) >= $1)", "spam" => "select count(*) from spam_logs where ($1::bigint is null or extract(epoch from created_at) >= $1)", "activity" => "select count(*) from activity_logs where ($1::bigint is null or extract(epoch from created_at) >= $1)", _ => "select count(*) from login_attempts where not succeeded and ($1::bigint is null or extract(epoch from created_at) >= $1)" };
+        sqlx::query_scalar(query)
+            .persistent(false)
+            .bind(start.map(|v| v as i64))
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    pub async fn clear_logs(&self, kind: &str, start: Option<u64>) -> Result<(), sqlx::Error> {
+        let table = match kind {
+            "views" => "view_logs",
+            "activity" => "activity_logs",
+            "spam" => "spam_logs",
+            _ => "login_attempts",
+        };
+        let query = format!("delete from {table} where ($1::bigint is null or extract(epoch from created_at) >= $1)");
+        sqlx::query(&query)
+            .persistent(false)
+            .bind(start.map(|v| v as i64))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 fn permissions_for_role(role: &Role) -> HashSet<String> {
