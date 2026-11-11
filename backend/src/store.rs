@@ -215,6 +215,67 @@ impl Persistence {
         Ok(store.users.len())
     }
 
+    async fn user_query(&self, predicate: &str, value: &str) -> Result<Option<User>, sqlx::Error> {
+        let query = format!(
+            "select u.id::text as id, u.username, u.email, u.password_hash, u.blocked,
+                    u.failed_login_count, floor(extract(epoch from u.last_login_at))::bigint as last_login,
+                    floor(extract(epoch from u.created_at))::bigint as created_at,
+                    coalesce(r.role_id, 'viewer') as role_id
+             from users u
+             left join lateral (select role_id from user_roles where user_id = u.id order by role_id limit 1) r on true
+             where {predicate}
+             limit 1"
+        );
+        let row = sqlx::query(&query)
+            .persistent(false)
+            .bind(value)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let role = match row.try_get::<String, _>("role_id")?.as_str() {
+                "super_admin" => Role::SuperAdmin,
+                "admin" => Role::Admin,
+                _ => Role::User,
+            };
+            Ok(User {
+                id: row.try_get("id")?,
+                username: row.try_get("username")?,
+                email: row.try_get("email")?,
+                password_hash: row.try_get("password_hash")?,
+                delegated_permissions: permissions_for_role(&role),
+                role,
+                blocked: row.try_get("blocked")?,
+                failed_login_count: row.try_get::<i32, _>("failed_login_count")?.max(0) as u32,
+                last_login: row
+                    .try_get::<Option<i64>, _>("last_login")?
+                    .map(|v| v.max(0) as u64),
+                created_at: row.try_get::<i64, _>("created_at")?.max(0) as u64,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn user_by_username(&self, username: &str) -> Result<Option<User>, sqlx::Error> {
+        self.user_query("lower(u.username) = lower($1)", username)
+            .await
+    }
+
+    pub async fn user_by_id(&self, id: &str) -> Result<Option<User>, sqlx::Error> {
+        if uuid::Uuid::parse_str(id).is_err() {
+            return Ok(None);
+        }
+        self.user_query("u.id = $1::uuid", id).await
+    }
+
+    pub async fn user_counts(&self) -> Result<(i64, i64), sqlx::Error> {
+        sqlx::query_as(
+            "select count(*)::bigint, count(*) filter (where blocked)::bigint from users",
+        )
+        .persistent(false)
+        .fetch_one(&self.pool)
+        .await
+    }
+
     /// Creates the initial superadmin exactly once. The advisory transaction lock
     /// prevents two booting instances from racing; an existing user means the
     /// bootstrap is permanently skipped.
@@ -245,6 +306,197 @@ impl Persistence {
         .fetch_one(&mut *tx)
         .await?;
         sqlx::query("insert into user_roles (user_id, role_id) values ($1, 'super_admin')")
+            .persistent(false)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn list_users(
+        &self,
+        search: &str,
+        page: usize,
+        limit: usize,
+    ) -> Result<(Vec<User>, i64), sqlx::Error> {
+        let pattern = format!("%{}%", search.to_lowercase());
+        let total: i64 = sqlx::query_scalar("select count(*) from users u left join lateral (select role_id from user_roles where user_id = u.id order by role_id limit 1) r on true where $1 = '%%' or lower(u.username || ' ' || u.email || ' ' || coalesce(r.role_id, 'viewer')) like $1")
+            .persistent(false).bind(&pattern).fetch_one(&self.pool).await?;
+        let rows = sqlx::query("select u.id::text as id, u.username, u.email, u.password_hash, u.blocked, u.failed_login_count, floor(extract(epoch from u.last_login_at))::bigint as last_login, floor(extract(epoch from u.created_at))::bigint as created_at, coalesce(r.role_id, 'viewer') as role_id from users u left join lateral (select role_id from user_roles where user_id = u.id order by role_id limit 1) r on true where $1 = '%%' or lower(u.username || ' ' || u.email || ' ' || coalesce(r.role_id, 'viewer')) like $1 order by u.created_at asc limit $2 offset $3")
+            .persistent(false).bind(&pattern).bind(limit as i64).bind(page.saturating_mul(limit) as i64).fetch_all(&self.pool).await?;
+        let users = rows
+            .into_iter()
+            .map(|row| {
+                let role = match row.try_get::<String, _>("role_id")?.as_str() {
+                    "super_admin" => Role::SuperAdmin,
+                    "admin" => Role::Admin,
+                    _ => Role::User,
+                };
+                Ok(User {
+                    id: row.try_get("id")?,
+                    username: row.try_get("username")?,
+                    email: row.try_get("email")?,
+                    password_hash: row.try_get("password_hash")?,
+                    role: role.clone(),
+                    delegated_permissions: permissions_for_role(&role),
+                    blocked: row.try_get("blocked")?,
+                    failed_login_count: row.try_get::<i32, _>("failed_login_count")?.max(0) as u32,
+                    last_login: row
+                        .try_get::<Option<i64>, _>("last_login")?
+                        .map(|v| v.max(0) as u64),
+                    created_at: row.try_get::<i64, _>("created_at")?.max(0) as u64,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        Ok((users, total))
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_user(
+        &self,
+        username: &str,
+        email: &str,
+        password_hash: &str,
+        role: &Role,
+        actor_id: &str,
+        actor: &str,
+        details: &str,
+        ip: &str,
+    ) -> Result<String, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "insert into users (username, email, password_hash) values ($1, $2, $3) returning id",
+        )
+        .persistent(false)
+        .bind(username)
+        .bind(email)
+        .bind(password_hash)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query("insert into user_roles (user_id, role_id) values ($1, $2)")
+            .persistent(false)
+            .bind(id)
+            .bind(role.as_str())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("insert into activity_logs (user_id, username_snapshot, action, details, ip_address) values ($1, $2, 'user.created', $3, nullif($4, '')::inet)").persistent(false).bind(uuid::Uuid::parse_str(actor_id).ok()).bind(actor).bind(details).bind(ip).execute(&mut *tx).await?;
+        sqlx::query("insert into audit_logs (actor_user_id, action, details, ip_address) values ($1, 'user.created', jsonb_build_object('actor', $2, 'message', $3), nullif($4, '')::inet)").persistent(false).bind(uuid::Uuid::parse_str(actor_id).ok()).bind(actor).bind(details).bind(ip).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(id.to_string())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_role(
+        &self,
+        id: &str,
+        role: &Role,
+        actor_id: &str,
+        actor: &str,
+        details: &str,
+        ip: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let target: Option<(uuid::Uuid, String, bool)> = sqlx::query_as("select u.id, coalesce(r.role_id, 'viewer'), u.blocked from users u left join lateral (select role_id from user_roles where user_id = u.id order by role_id limit 1) r on true where u.id = $1::uuid for update").persistent(false).bind(id).fetch_optional(&mut *tx).await?;
+        let Some((user_id, old_role, blocked)) = target else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        if old_role == "super_admin" && role != &Role::SuperAdmin && !blocked {
+            let active: i64 = sqlx::query_scalar("select count(*) from users u join user_roles r on r.user_id = u.id where r.role_id = 'super_admin' and not u.blocked").persistent(false).fetch_one(&mut *tx).await?;
+            if active <= 1 {
+                return Err(sqlx::Error::Protocol("last active super admin".into()));
+            }
+        }
+        sqlx::query("delete from user_roles where user_id = $1")
+            .persistent(false)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("insert into user_roles (user_id, role_id) values ($1, $2)")
+            .persistent(false)
+            .bind(user_id)
+            .bind(role.as_str())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from sessions where user_id = $1")
+            .persistent(false)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("insert into activity_logs (user_id, username_snapshot, action, details, ip_address) values ($1, $2, 'user.role_changed', $3, nullif($4, '')::inet)").persistent(false).bind(uuid::Uuid::parse_str(actor_id).ok()).bind(actor).bind(details).bind(ip).execute(&mut *tx).await?;
+        sqlx::query("insert into audit_logs (actor_user_id, action, details, ip_address) values ($1, 'user.role_changed', jsonb_build_object('actor', $2, 'message', $3), nullif($4, '')::inet)").persistent(false).bind(uuid::Uuid::parse_str(actor_id).ok()).bind(actor).bind(details).bind(ip).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_blocked(
+        &self,
+        id: &str,
+        blocked: bool,
+        actor_id: &str,
+        actor: &str,
+        action: &str,
+        details: &str,
+        ip: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let target: Option<(uuid::Uuid, String, bool)> = sqlx::query_as("select u.id, coalesce(r.role_id, 'viewer'), u.blocked from users u left join lateral (select role_id from user_roles where user_id = u.id order by role_id limit 1) r on true where u.id = $1::uuid for update").persistent(false).bind(id).fetch_optional(&mut *tx).await?;
+        let Some((user_id, role, old_blocked)) = target else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        if blocked && role == "super_admin" && !old_blocked {
+            let active: i64 = sqlx::query_scalar("select count(*) from users u join user_roles r on r.user_id = u.id where r.role_id = 'super_admin' and not u.blocked").persistent(false).fetch_one(&mut *tx).await?;
+            if active <= 1 {
+                return Err(sqlx::Error::Protocol("last active super admin".into()));
+            }
+        }
+        sqlx::query("update users set blocked = $2, updated_at = now() where id = $1")
+            .persistent(false)
+            .bind(user_id)
+            .bind(blocked)
+            .execute(&mut *tx)
+            .await?;
+        if blocked {
+            sqlx::query("delete from sessions where user_id = $1")
+                .persistent(false)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("insert into activity_logs (user_id, username_snapshot, action, details, ip_address) values ($1, $2, $3, $4, nullif($5, '')::inet)").persistent(false).bind(uuid::Uuid::parse_str(actor_id).ok()).bind(actor).bind(action).bind(details).bind(ip).execute(&mut *tx).await?;
+        sqlx::query("insert into audit_logs (actor_user_id, action, details, ip_address) values ($1, $2, jsonb_build_object('actor', $3, 'message', $4), nullif($5, '')::inet)").persistent(false).bind(uuid::Uuid::parse_str(actor_id).ok()).bind(action).bind(actor).bind(details).bind(ip).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn delete_user(
+        &self,
+        id: &str,
+        actor_id: &str,
+        actor: &str,
+        details: &str,
+        ip: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let target: Option<(uuid::Uuid, String, bool)> = sqlx::query_as("select u.id, coalesce(r.role_id, 'viewer'), u.blocked from users u left join lateral (select role_id from user_roles where user_id = u.id order by role_id limit 1) r on true where u.id = $1::uuid for update").persistent(false).bind(id).fetch_optional(&mut *tx).await?;
+        let Some((user_id, role, blocked)) = target else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        if role == "super_admin" && !blocked {
+            let active: i64 = sqlx::query_scalar("select count(*) from users u join user_roles r on r.user_id = u.id where r.role_id = 'super_admin' and not u.blocked").persistent(false).fetch_one(&mut *tx).await?;
+            if active <= 1 {
+                return Err(sqlx::Error::Protocol("last active super admin".into()));
+            }
+        }
+        sqlx::query("delete from sessions where user_id = $1")
+            .persistent(false)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("insert into activity_logs (user_id, username_snapshot, action, details, ip_address) values ($1, $2, 'user.deleted', $3, nullif($4, '')::inet)").persistent(false).bind(uuid::Uuid::parse_str(actor_id).ok()).bind(actor).bind(details).bind(ip).execute(&mut *tx).await?;
+        sqlx::query("insert into audit_logs (actor_user_id, action, details, ip_address) values ($1, 'user.deleted', jsonb_build_object('actor', $2, 'message', $3), nullif($4, '')::inet)").persistent(false).bind(uuid::Uuid::parse_str(actor_id).ok()).bind(actor).bind(details).bind(ip).execute(&mut *tx).await?;
+        sqlx::query("delete from users where id = $1")
             .persistent(false)
             .bind(user_id)
             .execute(&mut *tx)
@@ -415,8 +667,29 @@ impl Persistence {
         ip: &str,
         device: &str,
     ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("insert into login_attempts (attempted_username, ip_address, device_info, succeeded) values ($1, nullif($2, '')::inet, $3, false)")
-            .persistent(false).bind(username).bind(ip).bind(device).execute(&self.pool).await?;
+            .persistent(false).bind(username).bind(ip).bind(device).execute(&mut *tx).await?;
+        sqlx::query("update users set failed_login_count = failed_login_count + 1, updated_at = now() where lower(username) = lower($1)")
+            .persistent(false).bind(username).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn record_login_success(
+        &self,
+        user_id: &str,
+        username: &str,
+        ip: &str,
+        device: &str,
+        now: u64,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("insert into login_attempts (attempted_username, ip_address, device_info, succeeded) values ($1, nullif($2, '')::inet, $3, true)")
+            .persistent(false).bind(username).bind(ip).bind(device).execute(&mut *tx).await?;
+        sqlx::query("update users set failed_login_count = 0, last_login_at = to_timestamp($2), updated_at = now() where id = $1::uuid")
+            .persistent(false).bind(user_id).bind(now as i64).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -629,6 +902,18 @@ pub fn permissions_for(user: &User) -> HashSet<String> {
 }
 
 impl Store {
+    pub fn empty() -> Self {
+        Self {
+            users: HashMap::new(),
+            sessions: HashMap::new(),
+            activity: Vec::new(),
+            views: Vec::new(),
+            failed_logins: Vec::new(),
+            audits: Vec::new(),
+            spam: Vec::new(),
+        }
+    }
+
     pub fn seeded(config: &Config) -> Self {
         let created_at = now();
         let password_hash =

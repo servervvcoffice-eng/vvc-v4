@@ -67,15 +67,44 @@ async fn main() {
         tracing::warn!("DATABASE_URL is not configured; using process-local preview store");
         None
     };
-    let mut initial_store = Store::seeded(&config);
+    let mut initial_store = if config.is_production() {
+        Store::empty()
+    } else {
+        Store::seeded(&config)
+    };
     if let Some(persistence) = &persistence {
+        if config.is_production() {
+            let email = config
+                .bootstrap_email
+                .as_deref()
+                .expect("production bootstrap email validated");
+            let password_hash = match security::hash_password(&config.dev_password) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    tracing::error!(%error, "Could not hash bootstrap password");
+                    std::process::exit(78);
+                }
+            };
+            match persistence
+                .bootstrap_superadmin(email, &password_hash)
+                .await
+            {
+                Ok(true) => tracing::info!("Created the one-time bootstrap Super Admin"),
+                Ok(false) => {
+                    tracing::info!("Existing PostgreSQL users found; bootstrap permanently skipped")
+                }
+                Err(error) => {
+                    tracing::error!(%error, "Could not complete PostgreSQL bootstrap");
+                    std::process::exit(78);
+                }
+            }
+        }
         match persistence.load_users(&mut initial_store).await {
             Ok(count) if count > 0 => tracing::info!(users = count, "Loaded users from Supabase"),
-            Ok(_) if config.is_production() => {
-                tracing::error!("Supabase users table is empty; production bootstrap must be completed transactionally");
+            Ok(_) => {
+                tracing::error!("Supabase users table is empty after bootstrap");
                 std::process::exit(78);
             }
-            Ok(_) => tracing::warn!("Supabase users table is empty; retaining development seed"),
             Err(error) => {
                 tracing::error!(%error, "Could not load users from Supabase");
                 std::process::exit(78);
@@ -88,12 +117,6 @@ async fn main() {
         persistence,
         login_limiter,
     };
-    if config.is_production() {
-        tracing::error!(
-            "production startup is disabled until operational and security log handlers are fully PostgreSQL-backed"
-        );
-        std::process::exit(78);
-    }
     tracing::info!(environment = %config.app_env, "VVC Office configuration loaded");
     let app = Router::new()
         .route("/", get(handlers::root))

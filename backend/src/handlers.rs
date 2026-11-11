@@ -219,7 +219,20 @@ pub async fn login(
             "Too many attempts. Try again later.",
         );
     }
-    let found = state.pub_store.read().await.user_by_username(&username);
+    let found = if let Some(persistence) = &state.persistence {
+        match persistence.user_by_username(&username).await {
+            Ok(user) => user,
+            Err(error) => {
+                tracing::error!(%error, "durable user lookup failed during login");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Login temporarily unavailable",
+                );
+            }
+        }
+    } else {
+        state.pub_store.read().await.user_by_username(&username)
+    };
     let valid = found
         .as_ref()
         .map(|u| !u.blocked && security::verify_password(&payload.password, &u.password_hash))
@@ -268,6 +281,18 @@ pub async fn login(
             .await
         {
             tracing::error!(%error, "durable session creation failed");
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Login temporarily unavailable",
+            );
+        }
+    }
+    if let Some(persistence) = &state.persistence {
+        if let Err(error) = persistence
+            .record_login_success(&user.id, &user.username, &ip, &device, now)
+            .await
+        {
+            tracing::error!(%error, "durable successful login update failed");
             return json_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Login temporarily unavailable",
@@ -392,6 +417,25 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
         "User logged out",
         &ip,
     );
+    drop(db);
+    persist_activity(
+        &state,
+        Some(&ctx.user.id),
+        &ctx.user.username,
+        "logout",
+        "Session revoked",
+        &ip,
+    )
+    .await;
+    persist_audit(
+        &state,
+        Some(&ctx.user.id),
+        &ctx.user.username,
+        "session.revoked",
+        "User logged out",
+        &ip,
+    )
+    .await;
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
@@ -755,8 +799,17 @@ pub async fn admin_stats(
         let today_views = persistence.count_since("views", today).await.unwrap_or(0);
         let seven_day_views = persistence.count_since("views", seven).await.unwrap_or(0);
         let today_spam = persistence.count_since("spam", today).await.unwrap_or(0);
-        let db = state.pub_store.read().await;
-        return Json(json!({"total_users": db.users.len(), "today_views": today_views, "seven_day_views": seven_day_views, "blocked_users": db.users.values().filter(|u| u.blocked).count(), "today_spam": today_spam, "recent_activity": recent_activity})).into_response();
+        let (total_users, blocked_users) = match persistence.user_counts().await {
+            Ok(counts) => counts,
+            Err(error) => {
+                tracing::error!(%error, "durable user count lookup failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Statistics temporarily unavailable",
+                );
+            }
+        };
+        return Json(json!({"total_users": total_users, "today_views": today_views, "seven_day_views": seven_day_views, "blocked_users": blocked_users, "today_spam": today_spam, "recent_activity": recent_activity})).into_response();
     }
     let db = state.pub_store.read().await;
     let total_users = db.users.len();
@@ -849,8 +902,26 @@ pub async fn admin_users(
     {
         return json_error(StatusCode::FORBIDDEN, "Permission required");
     }
+    let limit = query.limit.unwrap_or(25).clamp(1, 100);
+    let page = query.page.unwrap_or(1).clamp(1, 10_000);
+    let search = query.search.as_deref().unwrap_or("");
+    if let Some(persistence) = &state.persistence {
+        let Ok((users, total)) = persistence.list_users(search, page - 1, limit).await else {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "User list temporarily unavailable",
+            );
+        };
+        return Json(Paged {
+            items: users.iter().map(summary).collect(),
+            total: total.max(0) as usize,
+            page,
+            limit,
+        })
+        .into_response();
+    }
     let db = state.pub_store.read().await;
-    let search = query.search.as_deref().unwrap_or("").to_lowercase();
+    let search = search.to_lowercase();
     let items: Vec<UserSummary> = db
         .users
         .values()
@@ -892,16 +963,6 @@ pub async fn admin_create_user(
             "Only Super Admin can create Super Admin accounts",
         );
     }
-    let mut db = state.pub_store.write().await;
-    if db
-        .users
-        .values()
-        .any(|u| u.username.eq_ignore_ascii_case(&username) || u.email.eq_ignore_ascii_case(&email))
-    {
-        return json_error(StatusCode::CONFLICT, "Username or email already exists");
-    }
-    let permissions = delegated_permissions(&ctx.user, &role);
-    let id = store::new_id();
     let password_hash = match security::hash_password(&payload.password) {
         Ok(v) => v,
         Err(_) => {
@@ -911,6 +972,56 @@ pub async fn admin_create_user(
             )
         }
     };
+    let ip = security::client_ip(&headers);
+    let details = format!("Created account {username}");
+    if let Some(persistence) = &state.persistence {
+        let id = match persistence
+            .create_user(
+                &username,
+                &email,
+                &password_hash,
+                &role,
+                &ctx.user.id,
+                &ctx.user.username,
+                &details,
+                &ip,
+            )
+            .await
+        {
+            Ok(id) => id,
+            Err(error)
+                if error.to_string().contains("duplicate")
+                    || error.to_string().contains("unique") =>
+            {
+                return json_error(StatusCode::CONFLICT, "Username or email already exists")
+            }
+            Err(error) => {
+                tracing::error!(%error, "durable user creation failed");
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, "Unable to create account");
+            }
+        };
+        let user = User {
+            id,
+            username,
+            email,
+            password_hash,
+            role: role.clone(),
+            delegated_permissions: delegated_permissions(&ctx.user, &role),
+            blocked: false,
+            failed_login_count: 0,
+            last_login: None,
+            created_at: store::now(),
+        };
+        state
+            .pub_store
+            .write()
+            .await
+            .users
+            .insert(user.id.clone(), user);
+        return (StatusCode::CREATED, Json(json!({"ok": true}))).into_response();
+    }
+    let permissions = delegated_permissions(&ctx.user, &role);
+    let id = store::new_id();
     let user = User {
         id: id.clone(),
         username: username.clone(),
@@ -923,19 +1034,15 @@ pub async fn admin_create_user(
         last_login: None,
         created_at: store::now(),
     };
+    let mut db = state.pub_store.write().await;
+    if db.users.values().any(|u| {
+        u.username.eq_ignore_ascii_case(&username) || u.email.eq_ignore_ascii_case(&user.email)
+    }) {
+        return json_error(StatusCode::CONFLICT, "Username or email already exists");
+    }
     db.users.insert(id, user);
-    db.add_activity(
-        &ctx.user.username,
-        "user.created",
-        &format!("Created {username} as {}", role.label()),
-        &security::client_ip(&headers),
-    );
-    db.add_audit(
-        &ctx.user.username,
-        "user.created",
-        &format!("Created account {username}"),
-        &security::client_ip(&headers),
-    );
+    db.add_activity(&ctx.user.username, "user.created", &details, &ip);
+    db.add_audit(&ctx.user.username, "user.created", &details, &ip);
     (StatusCode::CREATED, Json(json!({"ok": true}))).into_response()
 }
 
@@ -961,6 +1068,42 @@ pub async fn admin_update_role(
             "Only Super Admin can assign Super Admin",
         );
     }
+    let ip = security::client_ip(&headers);
+    if let Some(persistence) = &state.persistence {
+        let target = match persistence.user_by_id(&id).await {
+            Ok(target) => target,
+            Err(error) => {
+                tracing::error!(%error, "durable user lookup failed before role update");
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, "Unable to update role");
+            }
+        };
+        let Some(target) = target else {
+            return json_error(StatusCode::NOT_FOUND, "User not found");
+        };
+        let details = format!("Changed {} to {}", target.username, role.label());
+        match persistence
+            .update_role(&id, &role, &ctx.user.id, &ctx.user.username, &details, &ip)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return json_error(StatusCode::NOT_FOUND, "User not found"),
+            Err(error) if error.to_string().contains("last active super admin") => {
+                return json_error(
+                    StatusCode::CONFLICT,
+                    "The last active Super Admin cannot be demoted",
+                )
+            }
+            Err(error) => {
+                tracing::error!(%error, "durable role update failed");
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, "Unable to update role");
+            }
+        }
+        if let Some(stored) = state.pub_store.write().await.users.get_mut(&id) {
+            stored.role = role.clone();
+            stored.delegated_permissions = delegated_permissions(&ctx.user, &role);
+        }
+        return Json(json!({"ok": true})).into_response();
+    }
     let mut db = state.pub_store.write().await;
     let Some(target) = db.users.get(&id).cloned() else {
         return json_error(StatusCode::NOT_FOUND, "User not found");
@@ -984,13 +1127,13 @@ pub async fn admin_update_role(
         &ctx.user.username,
         "user.role_changed",
         &format!("{} -> {}", target.role.label(), role.label()),
-        &security::client_ip(&headers),
+        &ip,
     );
     db.add_audit(
         &ctx.user.username,
         "user.role_changed",
         &format!("Changed {} to {}", target.username, role.label()),
-        &security::client_ip(&headers),
+        &ip,
     );
     Json(json!({"ok": true})).into_response()
 }
@@ -1009,6 +1152,7 @@ pub async fn admin_unblock_user(
 ) -> Response {
     change_block(&state, &headers, &id, false).await
 }
+
 async fn change_block(state: &AppState, headers: &HeaderMap, id: &str, blocked: bool) -> Response {
     let Some(ctx) = api_context(state, headers, Some("admin.users.block")).await else {
         return json_error(StatusCode::FORBIDDEN, "Permission required");
@@ -1016,8 +1160,21 @@ async fn change_block(state: &AppState, headers: &HeaderMap, id: &str, blocked: 
     if !csrf_valid(headers, &ctx) {
         return json_error(StatusCode::FORBIDDEN, "CSRF validation failed");
     }
-    let mut db = state.pub_store.write().await;
-    let Some(target) = db.users.get(id).cloned() else {
+    let target = if let Some(persistence) = &state.persistence {
+        match persistence.user_by_id(id).await {
+            Ok(target) => target,
+            Err(error) => {
+                tracing::error!(%error, "durable user lookup failed before status update");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Unable to update account status",
+                );
+            }
+        }
+    } else {
+        state.pub_store.read().await.user(id)
+    };
+    let Some(target) = target else {
         return json_error(StatusCode::NOT_FOUND, "User not found");
     };
     if target.id == ctx.user.id {
@@ -1026,6 +1183,47 @@ async fn change_block(state: &AppState, headers: &HeaderMap, id: &str, blocked: 
             "You cannot change your own account status",
         );
     }
+    let action = if blocked {
+        "user.blocked"
+    } else {
+        "user.unblocked"
+    };
+    let ip = security::client_ip(headers);
+    if let Some(persistence) = &state.persistence {
+        match persistence
+            .set_blocked(
+                id,
+                blocked,
+                &ctx.user.id,
+                &ctx.user.username,
+                action,
+                &target.username,
+                &ip,
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return json_error(StatusCode::NOT_FOUND, "User not found"),
+            Err(error) if error.to_string().contains("last active super admin") => {
+                return json_error(
+                    StatusCode::CONFLICT,
+                    "The last active Super Admin cannot be blocked",
+                )
+            }
+            Err(error) => {
+                tracing::error!(%error, "durable user status update failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Unable to update account status",
+                );
+            }
+        }
+        if let Some(stored) = state.pub_store.write().await.users.get_mut(id) {
+            stored.blocked = blocked;
+        }
+        return Json(json!({"ok": true})).into_response();
+    }
+    let mut db = state.pub_store.write().await;
     if blocked
         && target.role == Role::SuperAdmin
         && !target.blocked
@@ -1042,23 +1240,8 @@ async fn change_block(state: &AppState, headers: &HeaderMap, id: &str, blocked: 
     if blocked {
         db.sessions.retain(|_, s| s.user_id != id);
     }
-    let action = if blocked {
-        "user.blocked"
-    } else {
-        "user.unblocked"
-    };
-    db.add_activity(
-        &ctx.user.username,
-        action,
-        &target.username,
-        &security::client_ip(headers),
-    );
-    db.add_audit(
-        &ctx.user.username,
-        action,
-        &target.username,
-        &security::client_ip(headers),
-    );
+    db.add_activity(&ctx.user.username, action, &target.username, &ip);
+    db.add_audit(&ctx.user.username, action, &target.username, &ip);
     Json(json!({"ok": true})).into_response()
 }
 
@@ -1073,13 +1256,48 @@ pub async fn admin_delete_user(
     if !csrf_valid(&headers, &ctx) {
         return json_error(StatusCode::FORBIDDEN, "CSRF validation failed");
     }
-    let mut db = state.pub_store.write().await;
-    let Some(target) = db.users.get(&id).cloned() else {
+    let target = if let Some(persistence) = &state.persistence {
+        match persistence.user_by_id(&id).await {
+            Ok(target) => target,
+            Err(error) => {
+                tracing::error!(%error, "durable user lookup failed before deletion");
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, "Unable to delete account");
+            }
+        }
+    } else {
+        state.pub_store.read().await.user(&id)
+    };
+    let Some(target) = target else {
         return json_error(StatusCode::NOT_FOUND, "User not found");
     };
     if target.id == ctx.user.id {
         return json_error(StatusCode::CONFLICT, "You cannot delete your own account");
     }
+    let ip = security::client_ip(&headers);
+    if let Some(persistence) = &state.persistence {
+        match persistence
+            .delete_user(&id, &ctx.user.id, &ctx.user.username, &target.username, &ip)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return json_error(StatusCode::NOT_FOUND, "User not found"),
+            Err(error) if error.to_string().contains("last active super admin") => {
+                return json_error(
+                    StatusCode::CONFLICT,
+                    "The last active Super Admin cannot be deleted",
+                )
+            }
+            Err(error) => {
+                tracing::error!(%error, "durable user deletion failed");
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, "Unable to delete account");
+            }
+        }
+        let mut db = state.pub_store.write().await;
+        db.users.remove(&id);
+        db.sessions.retain(|_, s| s.user_id != id);
+        return Json(json!({"ok": true})).into_response();
+    }
+    let mut db = state.pub_store.write().await;
     if target.role == Role::SuperAdmin && !target.blocked && db.active_super_admins() <= 1 {
         return json_error(
             StatusCode::CONFLICT,
@@ -1088,18 +1306,8 @@ pub async fn admin_delete_user(
     }
     db.users.remove(&id);
     db.sessions.retain(|_, s| s.user_id != id);
-    db.add_activity(
-        &ctx.user.username,
-        "user.deleted",
-        &target.username,
-        &security::client_ip(&headers),
-    );
-    db.add_audit(
-        &ctx.user.username,
-        "user.deleted",
-        &target.username,
-        &security::client_ip(&headers),
-    );
+    db.add_activity(&ctx.user.username, "user.deleted", &target.username, &ip);
+    db.add_audit(&ctx.user.username, "user.deleted", &target.username, &ip);
     Json(json!({"ok": true})).into_response()
 }
 
@@ -1347,6 +1555,15 @@ async fn clear_operational(
         return json_error(StatusCode::BAD_REQUEST, "Invalid date range");
     }
     let start = range_start(Some(range));
+    if let Some(persistence) = &state.persistence {
+        if let Err(error) = persistence.clear_logs(kind, start).await {
+            tracing::error!(%error, "durable operational log clear failed");
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Unable to clear operational logs",
+            );
+        }
+    }
     let mut db = state.pub_store.write().await;
     match kind {
         "views" => db
@@ -1372,9 +1589,6 @@ async fn clear_operational(
     );
     drop(db);
     if let Some(persistence) = &state.persistence {
-        if let Err(error) = persistence.clear_logs(kind, start).await {
-            tracing::error!(%error, "durable operational log clear failed");
-        }
         if let Err(error) = persistence
             .record_audit(
                 Some(&ctx.user.id),
@@ -1458,7 +1672,28 @@ async fn record_spam(
     method: &str,
     status: u16,
 ) {
-    let username = {
+    let username = if let Some(persistence) = &state.persistence {
+        let resolved = if let Some(token) = security::cookie_value(headers, "vvc_session") {
+            match persistence.session(&token).await {
+                Ok(Some((user_id, _, _, _, _))) => match persistence.user_by_id(&user_id).await {
+                    Ok(Some(user)) => Some(user.username),
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::error!(%error, "durable spam username lookup failed");
+                        None
+                    }
+                },
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::error!(%error, "durable spam session lookup failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        resolved.unwrap_or_else(|| "anonymous".into())
+    } else {
         let db = state.pub_store.read().await;
         security::cookie_value(headers, "vvc_session")
             .and_then(|token| db.sessions.get(&token))
@@ -1466,6 +1701,24 @@ async fn record_spam(
             .map(|user| user.username.clone())
             .unwrap_or_else(|| "anonymous".into())
     };
+    if let Some(persistence) = &state.persistence {
+        if let Err(error) = persistence
+            .record_spam(
+                &username,
+                ip,
+                fingerprint,
+                model,
+                device,
+                route,
+                method,
+                status,
+            )
+            .await
+        {
+            tracing::error!(%error, "durable spam log write failed");
+            return;
+        }
+    }
     let mut db = state.pub_store.write().await;
     db.add_spam(
         &username,
@@ -1477,19 +1730,6 @@ async fn record_spam(
         method,
         status,
     );
-    drop(db);
-    persist_spam(
-        &state,
-        &username,
-        ip,
-        fingerprint,
-        model,
-        device,
-        route,
-        method,
-        status,
-    )
-    .await;
 }
 
 pub async fn security_headers(request: Request<axum::body::Body>, next: Next) -> Response {
@@ -1541,16 +1781,22 @@ async fn auth_context(state: &AppState, headers: &HeaderMap) -> Option<AuthConte
             let _ = persistence.revoke_session(&token).await;
             return None;
         }
-        let (user, csrf_token) = {
-            let db = state.pub_store.read().await;
-            let user = db.user(&user_id)?;
-            let csrf_token = security::cookie_value(headers, "vvc_csrf").filter(|value| {
-                security::constant_time_equal(&security::hash_session_token(value), &csrf_hash)
-            });
-            let Some(csrf_token) = csrf_token else {
+        let user = match persistence.user_by_id(&user_id).await {
+            Ok(Some(user)) => user,
+            Ok(None) => {
+                let _ = persistence.revoke_session(&token).await;
                 return None;
-            };
-            (user, csrf_token)
+            }
+            Err(error) => {
+                tracing::error!(%error, "durable user lookup failed for session");
+                return None;
+            }
+        };
+        let csrf_token = security::cookie_value(headers, "vvc_csrf").filter(|value| {
+            security::constant_time_equal(&security::hash_session_token(value), &csrf_hash)
+        });
+        let Some(csrf_token) = csrf_token else {
+            return None;
         };
         if user.blocked {
             let _ = persistence.revoke_session(&token).await;
@@ -1673,36 +1919,6 @@ async fn persist_view(
         }
     }
 }
-async fn persist_spam(
-    state: &AppState,
-    username: &str,
-    ip: &str,
-    fingerprint: &str,
-    model: &str,
-    device: &str,
-    route: &str,
-    method: &str,
-    status: u16,
-) {
-    if let Some(persistence) = &state.persistence {
-        if let Err(error) = persistence
-            .record_spam(
-                username,
-                ip,
-                fingerprint,
-                model,
-                device,
-                route,
-                method,
-                status,
-            )
-            .await
-        {
-            tracing::error!(%error, "durable spam log write failed");
-        }
-    }
-}
-
 fn summary(u: &User) -> UserSummary {
     UserSummary {
         id: u.id.clone(),
