@@ -16,6 +16,13 @@ pub struct Config {
     pub gateway_secret: Option<String>,
     pub dev_password: String,
     pub cookie_secure: bool,
+    /// Extra CORS origins (comma-separated `ALLOWED_ORIGINS`), in addition
+    /// to `ALLOWED_ORIGIN`. The proxy flow is same-origin, so this list
+    /// should stay short and contain only origins we actually serve.
+    pub allowed_origins: Vec<String>,
+    /// How long operational logs (views/activity/failed logins/spam) are
+    /// kept before the retention job deletes them, in days.
+    pub log_retention_days: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,12 +46,29 @@ impl Config {
             cookie_secure: env::var("COOKIE_SECURE")
                 .map(|v| !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
+            allowed_origins: env::var("ALLOWED_ORIGINS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .collect(),
+            log_retention_days: parse_env("LOG_RETENTION_DAYS", 90_u64, 7..=3650)?,
         };
         config.validate()?;
         Ok(config)
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        // Fail closed on the gateway for every deployed environment, not
+        // just production: a public Render origin with no gateway secret
+        // lets anyone bypass the edge layer entirely. Local development
+        // (`APP_ENV=development`, the default) is the only exception.
+        if !self.app_env.eq_ignore_ascii_case("development") && self.gateway_secret.is_none() {
+            return Err(ConfigError(
+                "VVC_GATEWAY_SECRET is required outside local development".into(),
+            ));
+        }
         if self.app_env.eq_ignore_ascii_case("production") {
             if self.dev_password.is_empty() || self.dev_password == DEV_PASSWORD_PLACEHOLDER {
                 return Err(ConfigError(
@@ -104,13 +128,7 @@ where
                 .map_err(|_| ConfigError(format!("{name} must be an integer")))
         })
         .transpose()?
-        .unwrap_or_else(|| {
-            default
-                .to_string()
-                .parse::<u64>()
-                .ok()
-                .expect("default parses")
-        });
+        .unwrap_or_else(|| default.to_string().parse::<u64>().expect("default parses"));
     if !range.contains(&value) {
         return Err(ConfigError(format!("{name} is outside its allowed range")));
     }
