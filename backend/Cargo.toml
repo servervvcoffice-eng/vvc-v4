@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 argon2 = "0.5"
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 include_dir = "0.7"
 base64 = "0.22"
 http = "1"
