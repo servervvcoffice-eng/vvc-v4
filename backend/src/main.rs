@@ -16,7 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use store::{AppState, Store};
 use tokio::net::TcpListener;
-use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
 
 #[tokio::main]
 async fn main() {
@@ -52,6 +56,37 @@ async fn main() {
             std::process::exit(78);
         }
     };
+    // Per-account login throttle and the global throttle are separate
+    // counters from the per-IP login limiter (see rate_limit.rs).
+    let account_limiter = match rate_limit::LoginRateLimiter::connect(
+        config.redis_url.as_deref(),
+        config.is_production(),
+    )
+    .await
+    {
+        Ok(limiter) => limiter,
+        Err(error) => {
+            tracing::error!(%error, "Account rate limiter startup check failed");
+            std::process::exit(78);
+        }
+    };
+    let global_limiter = match rate_limit::LoginRateLimiter::connect_global(
+        config.redis_url.as_deref(),
+        config.is_production(),
+    )
+    .await
+    {
+        Ok(limiter) => limiter,
+        Err(error) => {
+            tracing::error!(%error, "Global rate limiter startup check failed");
+            std::process::exit(78);
+        }
+    };
+    if config.gateway_secret.is_none() {
+        tracing::warn!(
+            "VVC_GATEWAY_SECRET is not configured; direct-origin requests are not gateway-checked (local development only)"
+        );
+    }
     let persistence = if let Some(database_url) = &config.database_url {
         match store::Persistence::connect(database_url).await {
             Ok(persistence) => {
@@ -116,7 +151,33 @@ async fn main() {
         config: config.clone(),
         persistence,
         login_limiter,
+        account_limiter,
+        global_limiter,
     };
+    // Retention job: operational logs older than LOG_RETENTION_DAYS are
+    // deleted (database + in-memory). Security audit logs are never
+    // deleted by this job.
+    {
+        let retention_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
+            loop {
+                interval.tick().await;
+                let cutoff =
+                    store::now().saturating_sub(retention_state.config.log_retention_days * 86_400);
+                if let Some(persistence) = &retention_state.persistence {
+                    if let Err(error) = persistence.delete_old_logs(cutoff).await {
+                        tracing::error!(%error, "operational log retention cleanup failed");
+                    }
+                }
+                retention_state
+                    .pub_store
+                    .write()
+                    .await
+                    .prune_old_logs(cutoff);
+            }
+        });
+    }
     tracing::info!(environment = %config.app_env, "VVC Office configuration loaded");
     let app = Router::new()
         .route("/", get(handlers::root))
@@ -139,6 +200,7 @@ async fn main() {
         .route("/assets/admin.js", get(handlers::admin_js))
         .route("/assets/admin/*path", get(handlers::admin_file))
         .route("/api/me", get(handlers::me))
+        .route("/api/me/password", post(handlers::change_password))
         .route("/api/admin/stats", get(handlers::admin_stats))
         .route("/api/admin/activity", get(handlers::admin_activity))
         .route(
@@ -187,7 +249,13 @@ async fn main() {
         .layer(DefaultBodyLimit::max(config.max_body_bytes))
         .layer(
             CorsLayer::new()
-                .allow_origin(HeaderValue::from_static(config::ALLOWED_ORIGIN))
+                .allow_origin(AllowOrigin::list(
+                    std::iter::once(config::ALLOWED_ORIGIN)
+                        .chain(config.allowed_origins.iter().map(String::as_str))
+                        .map(HeaderValue::from_str)
+                        .collect::<Result<Vec<_>, _>>()
+                        .expect("allowed origins must be valid header values"),
+                ))
                 .allow_credentials(true)
                 .allow_methods([
                     Method::GET,

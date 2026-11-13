@@ -43,6 +43,10 @@ export async function onRequest(context) {
     'x-forwarded-host',
     'x-forwarded-proto',
     'x-vvc-request-id',
+    // See backend/cloudflare/worker/index.js: never forward a
+    // client-supplied IP header.
+    'cf-connecting-ip',
+    'x-real-ip',
   ]) {
     headers.delete(name);
   }
