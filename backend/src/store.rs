@@ -143,6 +143,12 @@ pub struct AppState {
     pub config: Config,
     pub persistence: Option<Arc<Persistence>>,
     pub login_limiter: LoginRateLimiter,
+    /// Per-username login throttle (same 8/min budget, keyed by the
+    /// lower-cased username). Without it, an attacker can stuff one
+    /// account's password from many IPs and the per-IP limiter never fires.
+    pub account_limiter: LoginRateLimiter,
+    /// Global per-IP throttle for all non-health requests.
+    pub global_limiter: LoginRateLimiter,
 }
 
 #[derive(Clone)]
@@ -505,6 +511,7 @@ impl Persistence {
         Ok(true)
     }
 
+    #[allow(dead_code)]
     pub async fn sync_users(&self, store: &Store) -> Result<(), sqlx::Error> {
         for user in store.users.values() {
             if uuid::Uuid::parse_str(&user.id).is_err() {
@@ -616,6 +623,7 @@ impl Persistence {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn revoke_user_sessions(&self, user_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("delete from sessions where user_id = $1::uuid")
             .persistent(false)
@@ -844,7 +852,7 @@ impl Persistence {
     }
 
     pub async fn count_since(&self, table: &str, start: Option<u64>) -> Result<i64, sqlx::Error> {
-        let query = match table { "views" => "select count(*) from view_logs where ($1::bigint is null or extract(epoch from created_at) >= $1)", "spam" => "select count(*) from spam_logs where ($1::bigint is null or extract(epoch from created_at) >= $1)", "activity" => "select count(*) from activity_logs where ($1::bigint is null or extract(epoch from created_at) >= $1)", _ => "select count(*) from login_attempts where not succeeded and ($1::bigint is null or extract(epoch from created_at) >= $1)" };
+        let query = match table { "views" => "select count(*) from view_logs where ($1::bigint is null or extract(epoch from created_at) >= $1)", "spam" => "select count(*) from spam_logs where ($1::bigint is null or extract(epoch from created_at) >= $1)", "activity" => "select count(*) from activity_logs where ($1::bigint is null or extract(epoch from created_at) >= $1)", "audit" => "select count(*) from audit_logs where ($1::bigint is null or extract(epoch from created_at) >= $1)", _ => "select count(*) from login_attempts where not succeeded and ($1::bigint is null or extract(epoch from created_at) >= $1)" };
         sqlx::query_scalar(query)
             .persistent(false)
             .bind(start.map(|v| v as i64))
@@ -853,13 +861,18 @@ impl Persistence {
     }
 
     pub async fn clear_logs(&self, kind: &str, start: Option<u64>) -> Result<(), sqlx::Error> {
-        let table = match kind {
-            "views" => "view_logs",
-            "activity" => "activity_logs",
-            "spam" => "spam_logs",
-            _ => "login_attempts",
+        // Table names come only from this fixed match, never from user
+        // input, so interpolating them is safe; every value is bound.
+        // Clearing "failed" logins must not erase successful logins too:
+        // previously it deleted every row in login_attempts, including the
+        // successful-login audit trail.
+        let (table, extra) = match kind {
+            "views" => ("view_logs", ""),
+            "activity" => ("activity_logs", ""),
+            "spam" => ("spam_logs", ""),
+            _ => ("login_attempts", "not succeeded and "),
         };
-        let query = format!("delete from {table} where ($1::bigint is null or extract(epoch from created_at) >= $1)");
+        let query = format!("delete from {table} where {extra}($1::bigint is null or extract(epoch from created_at) >= $1)");
         sqlx::query(&query)
             .persistent(false)
             .bind(start.map(|v| v as i64))
@@ -867,16 +880,76 @@ impl Persistence {
             .await?;
         Ok(())
     }
+
+    /// Retention job: delete operational logs older than `cutoff` (epoch
+    /// seconds). Security audit logs are never deleted by this job.
+    pub async fn delete_old_logs(&self, cutoff: u64) -> Result<(), sqlx::Error> {
+        for table in ["view_logs", "activity_logs", "spam_logs", "login_attempts"] {
+            let query = format!("delete from {table} where extract(epoch from created_at) < $1");
+            sqlx::query(&query)
+                .persistent(false)
+                .bind(cutoff as i64)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Change a user's password hash and revoke every session for that
+    /// user, so a changed password immediately invalidates sessions that
+    /// may have been created with the old one.
+    pub async fn update_password(
+        &self,
+        user_id: &str,
+        password_hash: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "update users set password_hash = $2, failed_login_count = 0, updated_at = now() where id = $1::uuid",
+        )
+        .persistent(false)
+        .bind(user_id)
+        .bind(password_hash)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("delete from sessions where user_id = $1::uuid")
+            .persistent(false)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
 }
 
-fn permissions_for_role(role: &Role) -> HashSet<String> {
+pub(crate) fn permissions_for_role(role: &Role) -> HashSet<String> {
     match role {
         Role::SuperAdmin => ALL_PERMISSIONS.iter().map(|s| (*s).to_string()).collect(),
-        Role::Admin => ALL_PERMISSIONS
-            .iter()
-            .filter(|permission| **permission != "admin.audit_logs.read")
-            .map(|s| (*s).to_string())
-            .collect(),
+        // Least privilege for delegated Admins: they can read the console
+        // and block/unblock accounts, but destructive and privilege-granting
+        // actions — creating users, deleting users, changing roles, and
+        // clearing any log — are Super Admin only. Previously an Admin held
+        // 16 of 17 permissions, so a compromised Admin account was nearly
+        // as powerful as a Super Admin.
+        Role::Admin => [
+            "home.read",
+            "about.read",
+            "admin.dashboard.read",
+            "admin.users.read",
+            "admin.users.block",
+            "admin.views.read",
+            "admin.activity.read",
+            "admin.failed_logins.read",
+            "admin.spam.read",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
         Role::User => ["home.read", "about.read"]
             .into_iter()
             .map(str::to_string)
@@ -892,6 +965,19 @@ pub fn now() -> u64 {
 }
 pub fn new_id() -> String {
     security::random_token(16)
+}
+
+/// Bound on each in-memory operational log. Previously these `Vec`s grew
+/// forever — every request added a spam/view/activity entry — so a busy or
+/// attacked server would eventually exhaust memory.
+pub const MAX_MEMORY_LOG_ENTRIES: usize = 5_000;
+
+fn push_capped<T>(log: &mut Vec<T>, entry: T) {
+    if log.len() >= MAX_MEMORY_LOG_ENTRIES {
+        let excess = log.len() - MAX_MEMORY_LOG_ENTRIES + 1;
+        log.drain(..excess);
+    }
+    log.push(entry);
 }
 
 pub fn permissions_for(user: &User) -> HashSet<String> {
@@ -953,6 +1039,14 @@ impl Store {
     pub fn user(&self, id: &str) -> Option<User> {
         self.users.get(id).cloned()
     }
+    /// Drop in-memory operational logs older than `cutoff` (epoch secs).
+    pub fn prune_old_logs(&mut self, cutoff: u64) {
+        self.views.retain(|v| v.timestamp >= cutoff);
+        self.activity.retain(|a| a.timestamp >= cutoff);
+        self.failed_logins.retain(|f| f.timestamp >= cutoff);
+        self.spam.retain(|s| s.timestamp >= cutoff);
+    }
+
     pub fn active_super_admins(&self) -> usize {
         self.users
             .values()
@@ -961,43 +1055,55 @@ impl Store {
     }
 
     pub fn add_activity(&mut self, user: &str, action: &str, details: &str, ip: &str) {
-        self.activity.push(ActivityLog {
-            id: new_id(),
-            user: user.into(),
-            action: action.into(),
-            details: details.into(),
-            ip: ip.into(),
-            timestamp: now(),
-        });
+        push_capped(
+            &mut self.activity,
+            ActivityLog {
+                id: new_id(),
+                user: user.into(),
+                action: action.into(),
+                details: details.into(),
+                ip: ip.into(),
+                timestamp: now(),
+            },
+        );
     }
     pub fn add_view(&mut self, page: &str, user: &str, ip: &str, device: &str) {
-        self.views.push(ViewLog {
-            id: new_id(),
-            page: page.into(),
-            user: user.into(),
-            ip: ip.into(),
-            device: device.into(),
-            timestamp: now(),
-        });
+        push_capped(
+            &mut self.views,
+            ViewLog {
+                id: new_id(),
+                page: page.into(),
+                user: user.into(),
+                ip: ip.into(),
+                device: device.into(),
+                timestamp: now(),
+            },
+        );
     }
     pub fn add_failed(&mut self, username: &str, ip: &str, device: &str) {
-        self.failed_logins.push(FailedLogin {
-            id: new_id(),
-            attempted_username: username.into(),
-            ip: ip.into(),
-            device: device.into(),
-            timestamp: now(),
-        });
+        push_capped(
+            &mut self.failed_logins,
+            FailedLogin {
+                id: new_id(),
+                attempted_username: username.into(),
+                ip: ip.into(),
+                device: device.into(),
+                timestamp: now(),
+            },
+        );
     }
     pub fn add_audit(&mut self, actor: &str, action: &str, details: &str, ip: &str) {
-        self.audits.push(AuditLog {
-            id: new_id(),
-            actor: actor.into(),
-            action: action.into(),
-            details: details.into(),
-            ip: ip.into(),
-            timestamp: now(),
-        });
+        push_capped(
+            &mut self.audits,
+            AuditLog {
+                id: new_id(),
+                actor: actor.into(),
+                action: action.into(),
+                details: details.into(),
+                ip: ip.into(),
+                timestamp: now(),
+            },
+        );
     }
     #[allow(clippy::too_many_arguments)]
     pub fn add_spam(
@@ -1011,17 +1117,70 @@ impl Store {
         method: &str,
         status: u16,
     ) {
-        self.spam.push(SpamLog {
-            id: new_id(),
-            username: username.into(),
-            ip: ip.into(),
-            device_fingerprint: fingerprint.into(),
-            device_model: model.into(),
-            device: device.into(),
-            route: route.into(),
-            method: method.into(),
-            status,
-            timestamp: now(),
-        });
+        push_capped(
+            &mut self.spam,
+            SpamLog {
+                id: new_id(),
+                username: username.into(),
+                ip: ip.into(),
+                device_fingerprint: fingerprint.into(),
+                device_model: model.into(),
+                device: device.into(),
+                route: route.into(),
+                method: method.into(),
+                status,
+                timestamp: now(),
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_role_is_least_privilege() {
+        let perms = permissions_for_role(&Role::Admin);
+        // Destructive / privilege-granting actions are Super Admin only.
+        for forbidden in [
+            "admin.users.create",
+            "admin.users.delete",
+            "admin.users.update_role",
+            "admin.views.clear",
+            "admin.activity.clear",
+            "admin.failed_logins.clear",
+            "admin.spam.clear",
+            "admin.audit_logs.read",
+        ] {
+            assert!(
+                !perms.contains(forbidden),
+                "{forbidden} must not be an Admin permission"
+            );
+        }
+        for allowed in [
+            "home.read",
+            "admin.dashboard.read",
+            "admin.users.read",
+            "admin.users.block",
+        ] {
+            assert!(
+                perms.contains(allowed),
+                "{allowed} must be an Admin permission"
+            );
+        }
+        assert_eq!(
+            permissions_for_role(&Role::SuperAdmin).len(),
+            ALL_PERMISSIONS.len()
+        );
+    }
+
+    #[test]
+    fn memory_logs_are_capped() {
+        let mut store = Store::empty();
+        for _ in 0..MAX_MEMORY_LOG_ENTRIES + 100 {
+            store.add_activity("u", "login", "ok", "203.0.113.10");
+        }
+        assert_eq!(store.activity.len(), MAX_MEMORY_LOG_ENTRIES);
     }
 }
