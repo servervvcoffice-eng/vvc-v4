@@ -47,12 +47,22 @@ pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     })
 }
 
+/// Client IP, trusted only from `cf-connecting-ip`.
+///
+/// `x-real-ip` is deliberately ignored: any client can set it, so trusting it
+/// lets an attacker rotate the apparent IP and bypass the per-IP login
+/// throttle. `cf-connecting-ip` is set (and overwritten) by the Cloudflare
+/// edge, and every proxy in this repo strips a client-supplied value before
+/// forwarding. The value must also parse as a single IP address: lists such
+/// as `1.2.3.4, 5.6.7.8`, garbage, and overly long values fall back to
+/// `unknown` instead of poisoning rate-limit keys and `inet` columns.
 pub fn client_ip(headers: &HeaderMap) -> String {
     headers
         .get("cf-connecting-ip")
-        .or_else(|| headers.get("x-real-ip"))
         .and_then(|v| v.to_str().ok())
-        .filter(|v| v.len() <= 128)
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 45)
+        .filter(|v| v.parse::<std::net::IpAddr>().is_ok())
         .unwrap_or("unknown")
         .to_string()
 }
@@ -103,10 +113,13 @@ pub fn session_cookie(token: &str, max_age: u64, secure: bool) -> String {
     }
 }
 pub fn csrf_cookie(token: &str, max_age: u64, secure: bool) -> String {
+    // HttpOnly: browser JavaScript never reads this cookie directly — the
+    // token is delivered to scripts via `GET /api/me` — so there is no
+    // reason to expose it to `document.cookie` for an XSS payload to steal.
     if secure {
-        format!("vvc_csrf={token}; Path=/; Max-Age={max_age}; Secure; SameSite=None")
+        format!("vvc_csrf={token}; Path=/; Max-Age={max_age}; HttpOnly; Secure; SameSite=None")
     } else {
-        format!("vvc_csrf={token}; Path=/; Max-Age={max_age}; SameSite=Lax")
+        format!("vvc_csrf={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax")
     }
 }
 pub fn expired_session_cookie(secure: bool) -> String {
@@ -118,8 +131,94 @@ pub fn expired_session_cookie(secure: bool) -> String {
 }
 pub fn expired_csrf_cookie(secure: bool) -> String {
     if secure {
-        "vvc_csrf=; Path=/; Max-Age=0; Secure; SameSite=None".into()
+        "vvc_csrf=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None".into()
     } else {
-        "vvc_csrf=; Path=/; Max-Age=0; SameSite=Lax".into()
+        "vvc_csrf=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax".into()
+    }
+}
+
+/// Common-password and weak-password rejection for user creation and
+/// password changes. This is a small denylist, not a substitute for a
+/// breached-password check, but it stops the weakest choices outright.
+pub fn is_weak_password(password: &str, username: &str, email: &str) -> bool {
+    const COMMON: [&str; 12] = [
+        "password",
+        "password123",
+        "password1234",
+        "123456789012",
+        "1234567890",
+        "qwerty123456",
+        "letmein12345",
+        "admin123456",
+        "changeme123",
+        "welcome12345",
+        "vvc123456789",
+        "superadmin12",
+    ];
+    let lower = password.to_ascii_lowercase();
+    if COMMON.contains(&lower.as_str()) {
+        return true;
+    }
+    let user = username.to_ascii_lowercase();
+    if !user.is_empty() && lower.contains(&user) {
+        return true;
+    }
+    if let Some(local) = email.split('@').next() {
+        let local = local.to_ascii_lowercase();
+        if local.len() >= 4 && lower.contains(&local) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn headers_with(name: &str, value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            name.parse::<axum::http::HeaderName>().unwrap(),
+            axum::http::HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn client_ip_accepts_only_a_single_valid_ip() {
+        assert_eq!(
+            client_ip(&headers_with("cf-connecting-ip", "203.0.113.10")),
+            "203.0.113.10"
+        );
+        // Lists, garbage and spoofable x-real-ip must not be trusted.
+        assert_eq!(
+            client_ip(&headers_with(
+                "cf-connecting-ip",
+                "203.0.113.10, 198.51.100.1"
+            )),
+            "unknown"
+        );
+        assert_eq!(
+            client_ip(&headers_with("cf-connecting-ip", "not-an-ip")),
+            "unknown"
+        );
+        assert_eq!(
+            client_ip(&headers_with("x-real-ip", "203.0.113.10")),
+            "unknown"
+        );
+        assert_eq!(client_ip(&HeaderMap::new()), "unknown");
+    }
+
+    #[test]
+    fn weak_passwords_are_rejected() {
+        assert!(is_weak_password("password1234", "ops", "ops@example.com"));
+        assert!(is_weak_password("ops-secret-99", "ops", "ops@example.com"));
+        assert!(!is_weak_password(
+            "correct horse battery staple",
+            "ops",
+            "ops@example.com"
+        ));
     }
 }
