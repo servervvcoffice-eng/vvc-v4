@@ -24,6 +24,11 @@ export default {
       'x-forwarded-host',
       'x-forwarded-proto',
       'x-vvc-request-id',
+      // Never forward a client-supplied IP: it would let the caller pick
+      // the IP the backend rate-limits and logs. Cloudflare sets
+      // cf-connecting-ip itself on the request to the origin.
+      'cf-connecting-ip',
+      'x-real-ip',
     ]) headers.delete(name);
     headers.set('x-vvc-gateway', env.ORIGIN_GATEWAY_SECRET);
     headers.set('x-forwarded-proto', 'https');
