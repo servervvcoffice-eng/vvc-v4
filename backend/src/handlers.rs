@@ -28,8 +28,8 @@ const ABOUT_HTML: &str = include_str!("../project/about/index.html");
 const ABOUT_CSS: &str = include_str!("../project/about/style.css");
 const ABOUT_JS: &str = include_str!("../project/about/app.js");
 const ADMIN_HTML: &str = include_str!("../project/admin/index.html");
-const ADMIN_CSS: &str = "";
-const ADMIN_JS: &str = "";
+const ADMIN_CSS: &str = include_str!("../project/admin/style.css");
+const ADMIN_JS: &str = include_str!("../project/admin/app.js");
 const NOT_FOUND_HTML: &str = include_str!("../public/404.html");
 static ADMIN_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/project/admin");
 
@@ -54,6 +54,11 @@ pub struct CreateUserPayload {
 #[derive(Deserialize)]
 pub struct RolePayload {
     role: String,
+}
+#[derive(Deserialize)]
+pub struct ChangePasswordPayload {
+    current_password: String,
+    new_password: String,
 }
 #[derive(Deserialize, Default)]
 pub struct ListQuery {
@@ -126,7 +131,14 @@ pub async fn not_found() -> Response {
     )
         .into_response()
 }
-pub async fn routes_manifest() -> impl IntoResponse {
+pub async fn routes_manifest(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if auth_context(&state, &headers).await.is_none() {
+        return json_error(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+    routes_manifest_inner().await.into_response()
+}
+
+async fn routes_manifest_inner() -> impl IntoResponse {
     let mut routes = vec![
         json!({"path":"/", "title":"Home"}),
         json!({"path":"/login", "title":"Sign in"}),
@@ -199,9 +211,17 @@ pub async fn login(
         return json_error(StatusCode::UNAUTHORIZED, "Invalid username or password");
     }
     let now = store::now();
-    let throttled = match state.login_limiter.is_throttled(&ip).await {
-        Ok(throttled) => throttled,
-        Err(error) => {
+    // Throttle by IP *and* by account. Per-IP alone lets an attacker stuff
+    // one account's password from many IPs; per-account alone lets one IP
+    // stuff many accounts. The account key is hashed by the limiter, so the
+    // username itself never lands in Redis.
+    let account_key = format!("user:{}", username.to_lowercase());
+    let throttled = match (
+        state.login_limiter.is_throttled(&ip).await,
+        state.account_limiter.is_throttled(&account_key).await,
+    ) {
+        (Ok(ip_throttled), Ok(account_throttled)) => ip_throttled || account_throttled,
+        (Err(error), _) | (_, Err(error)) => {
             tracing::error!(%error, "login rate limiter check failed");
             return json_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -238,7 +258,11 @@ pub async fn login(
         .map(|u| !u.blocked && security::verify_password(&payload.password, &u.password_hash))
         .unwrap_or(false);
     if !valid {
-        let rate_error = state.login_limiter.record_failure(&ip).await.err();
+        let rate_error = state.login_limiter.record_failure(&ip).await.err().or(state
+            .account_limiter
+            .record_failure(&account_key)
+            .await
+            .err());
         let mut db = state.pub_store.write().await;
         db.add_failed(&username, &ip, &device);
         if let Some(user) = found {
@@ -260,6 +284,13 @@ pub async fn login(
     let user = found.expect("valid login has user");
     if let Err(error) = state.login_limiter.clear(&ip).await {
         tracing::error!(%error, "login rate limiter clear failed");
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Login temporarily unavailable",
+        );
+    }
+    if let Err(error) = state.account_limiter.clear(&account_key).await {
+        tracing::error!(%error, "account rate limiter clear failed");
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Login temporarily unavailable",
@@ -451,6 +482,98 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
     response
 }
 
+/// Change the signed-in user's own password.
+///
+/// Previously there was no way to rotate a password at all: the bootstrap
+/// password lived on in the database even after `VVC_DEV_PASSWORD` changed,
+/// so a leaked Super Admin password could never be revoked from the app.
+/// Changing the password revokes every session for the account (including
+/// this one), so the caller must sign in again with the new password.
+pub async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ChangePasswordPayload>,
+) -> Response {
+    let Some(ctx) = api_context(&state, &headers, None).await else {
+        return json_error(StatusCode::UNAUTHORIZED, "Authentication required");
+    };
+    if !csrf_valid(&headers, &ctx) {
+        return json_error(StatusCode::FORBIDDEN, "CSRF validation failed");
+    }
+    if payload.new_password.len() < 12
+        || payload.new_password.len() > 256
+        || payload.new_password == payload.current_password
+        || security::is_weak_password(&payload.new_password, &ctx.user.username, &ctx.user.email)
+    {
+        return json_error(StatusCode::BAD_REQUEST, "Invalid new password");
+    }
+    if !security::verify_password(&payload.current_password, &ctx.user.password_hash) {
+        return json_error(StatusCode::UNAUTHORIZED, "Current password is incorrect");
+    }
+    let password_hash = match security::hash_password(&payload.new_password) {
+        Ok(hash) => hash,
+        Err(_) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Unable to change password",
+            )
+        }
+    };
+    let ip = security::client_ip(&headers);
+    if let Some(persistence) = &state.persistence {
+        match persistence
+            .update_password(&ctx.user.id, &password_hash)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return json_error(StatusCode::NOT_FOUND, "User not found"),
+            Err(error) => {
+                tracing::error!(%error, "durable password change failed");
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, "Unable to change password");
+            }
+        }
+        persist_activity(
+            &state,
+            Some(&ctx.user.id),
+            &ctx.user.username,
+            "password.changed",
+            "Password changed; all sessions revoked",
+            &ip,
+        )
+        .await;
+        persist_audit(
+            &state,
+            Some(&ctx.user.id),
+            &ctx.user.username,
+            "password.changed",
+            "Password changed; all sessions revoked",
+            &ip,
+        )
+        .await;
+    }
+    let mut db = state.pub_store.write().await;
+    if let Some(stored) = db.users.get_mut(&ctx.user.id) {
+        stored.password_hash = password_hash;
+        stored.failed_login_count = 0;
+    }
+    db.sessions
+        .retain(|_, session| session.user_id != ctx.user.id);
+    db.add_activity(
+        &ctx.user.username,
+        "password.changed",
+        "Password changed; all sessions revoked",
+        &ip,
+    );
+    db.add_audit(
+        &ctx.user.username,
+        "password.changed",
+        "Password changed; all sessions revoked",
+        &ip,
+    );
+    drop(db);
+    Json(json!({"ok": true, "message": "Password changed. Sign in again."})).into_response()
+}
+
 pub async fn home_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
     protected_page(&state, &headers, "home.read", HOME_HTML, "Home").await
 }
@@ -545,6 +668,8 @@ pub async fn admin_file(
     {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
+    // Missing files return 404 regardless of auth (matching the public
+    // 404 behaviour); existing files still require auth + permission.
     let Some(file) = ADMIN_DIR.get_file(&path) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
@@ -659,8 +784,11 @@ pub async fn dynamic_route(
         let Some((content, content_type)) = read_project_file(slug, relative).await else {
             return not_found().await;
         };
-        if auth_context(&state, &headers).await.is_none() {
+        let Some(ctx) = auth_context(&state, &headers).await else {
             return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        };
+        if !has_permission(&ctx.user, "home.read") {
+            return safe_forbidden_page();
         }
         return Response::builder()
             .status(StatusCode::OK)
@@ -677,9 +805,15 @@ pub async fn dynamic_route(
     let Some((content, _)) = read_project_file(path, "index.html").await else {
         return not_found().await;
     };
+    // Existing pages require auth plus an explicit permission: previously
+    // any authenticated account could open any newly uploaded page, with
+    // no permission check at all.
     let Some(ctx) = auth_context(&state, &headers).await else {
         return Redirect::temporary("/login").into_response();
     };
+    if !has_permission(&ctx.user, "home.read") {
+        return safe_forbidden_page();
+    }
     let page = path.to_string();
     let ip = security::client_ip(&headers);
     let device = security::device(&headers);
@@ -722,7 +856,7 @@ async fn protected_page(
     db.add_view(page, &ctx.user.username, &ip, &device);
     drop(db);
     persist_view(
-        &state,
+        state,
         page,
         Some(&ctx.user.id),
         &ctx.user.username,
@@ -792,13 +926,48 @@ pub async fn admin_stats(
     let today = range_start(Some("today"));
     let seven = range_start(Some("7d"));
     if let Some(persistence) = &state.persistence {
-        let recent_activity = persistence
-            .activity(start, "", 0, 8)
-            .await
-            .unwrap_or_default();
-        let today_views = persistence.count_since("views", today).await.unwrap_or(0);
-        let seven_day_views = persistence.count_since("views", seven).await.unwrap_or(0);
-        let today_spam = persistence.count_since("spam", today).await.unwrap_or(0);
+        // A database failure must surface as 503, not as a dashboard full
+        // of zeroes that hides the outage (and any activity during it).
+        let recent_activity = match persistence.activity(start, "", 0, 8).await {
+            Ok(items) => items,
+            Err(error) => {
+                tracing::error!(%error, "durable activity lookup failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Statistics temporarily unavailable",
+                );
+            }
+        };
+        let today_views = match persistence.count_since("views", today).await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::error!(%error, "durable view count lookup failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Statistics temporarily unavailable",
+                );
+            }
+        };
+        let seven_day_views = match persistence.count_since("views", seven).await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::error!(%error, "durable view count lookup failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Statistics temporarily unavailable",
+                );
+            }
+        };
+        let today_spam = match persistence.count_since("spam", today).await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::error!(%error, "durable spam count lookup failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Statistics temporarily unavailable",
+                );
+            }
+        };
         let (total_users, blocked_users) = match persistence.user_counts().await {
             Ok(counts) => counts,
             Err(error) => {
@@ -857,15 +1026,26 @@ pub async fn admin_activity(
     if let Some(persistence) = &state.persistence {
         let limit = query.limit.unwrap_or(25).clamp(1, 100);
         let page = query.page.unwrap_or(1).clamp(1, 10_000);
-        let items = persistence
-            .activity(start, &search, page - 1, limit)
-            .await
-            .unwrap_or_default();
-        let total = persistence
-            .count_since("activity", start)
-            .await
-            .unwrap_or(0)
-            .max(0) as usize;
+        let items = match persistence.activity(start, &search, page - 1, limit).await {
+            Ok(items) => items,
+            Err(error) => {
+                tracing::error!(%error, "durable activity lookup failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Data temporarily unavailable",
+                );
+            }
+        };
+        let total = match persistence.count_since("activity", start).await {
+            Ok(count) => count.max(0) as usize,
+            Err(error) => {
+                tracing::error!(%error, "durable count lookup failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Data temporarily unavailable",
+                );
+            }
+        };
         return Json(Paged {
             items,
             total,
@@ -944,12 +1124,16 @@ pub async fn admin_create_user(
     let Some(ctx) = api_context(&state, &headers, Some("admin.users.create")).await else {
         return json_error(StatusCode::FORBIDDEN, "Permission required");
     };
+    if !csrf_valid(&headers, &ctx) {
+        return json_error(StatusCode::FORBIDDEN, "CSRF validation failed");
+    }
     let username = payload.username.trim().to_string();
     let email = payload.email.trim().to_string();
     if !valid_username(&username)
         || !valid_email(&email)
         || payload.password.len() < 12
         || payload.password.len() > 256
+        || security::is_weak_password(&payload.password, &username, &email)
     {
         return json_error(StatusCode::BAD_REQUEST, "Invalid user fields");
     }
@@ -1337,15 +1521,26 @@ pub async fn admin_views(
     if let Some(persistence) = &state.persistence {
         let limit = query.limit.unwrap_or(25).clamp(1, 100);
         let page = query.page.unwrap_or(1).clamp(1, 10_000);
-        let items = persistence
-            .views(start, &page_name, page - 1, limit)
-            .await
-            .unwrap_or_default();
-        let total = persistence
-            .count_since("views", start)
-            .await
-            .unwrap_or(0)
-            .max(0) as usize;
+        let items = match persistence.views(start, &page_name, page - 1, limit).await {
+            Ok(items) => items,
+            Err(error) => {
+                tracing::error!(%error, "durable views lookup failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Data temporarily unavailable",
+                );
+            }
+        };
+        let total = match persistence.count_since("views", start).await {
+            Ok(count) => count.max(0) as usize,
+            Err(error) => {
+                tracing::error!(%error, "durable count lookup failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Data temporarily unavailable",
+                );
+            }
+        };
         return Json(Paged {
             items,
             total,
@@ -1381,15 +1576,26 @@ pub async fn admin_failed_logins(
     if let Some(persistence) = &state.persistence {
         let limit = query.limit.unwrap_or(25).clamp(1, 100);
         let page = query.page.unwrap_or(1).clamp(1, 10_000);
-        let items = persistence
-            .failed_logins(start, page - 1, limit)
-            .await
-            .unwrap_or_default();
-        let total = persistence
-            .count_since("failed", start)
-            .await
-            .unwrap_or(0)
-            .max(0) as usize;
+        let items = match persistence.failed_logins(start, page - 1, limit).await {
+            Ok(items) => items,
+            Err(error) => {
+                tracing::error!(%error, "durable failed_logins lookup failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Data temporarily unavailable",
+                );
+            }
+        };
+        let total = match persistence.count_since("failed", start).await {
+            Ok(count) => count.max(0) as usize,
+            Err(error) => {
+                tracing::error!(%error, "durable count lookup failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Data temporarily unavailable",
+                );
+            }
+        };
         return Json(Paged {
             items,
             total,
@@ -1425,15 +1631,26 @@ pub async fn admin_spam(
     if let Some(persistence) = &state.persistence {
         let limit = query.limit.unwrap_or(25).clamp(1, 100);
         let page = query.page.unwrap_or(1).clamp(1, 10_000);
-        let items = persistence
-            .spam(start, &search, page - 1, limit)
-            .await
-            .unwrap_or_default();
-        let total = persistence
-            .count_since("spam", start)
-            .await
-            .unwrap_or(0)
-            .max(0) as usize;
+        let items = match persistence.spam(start, &search, page - 1, limit).await {
+            Ok(items) => items,
+            Err(error) => {
+                tracing::error!(%error, "durable spam lookup failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Data temporarily unavailable",
+                );
+            }
+        };
+        let total = match persistence.count_since("spam", start).await {
+            Ok(count) => count.max(0) as usize,
+            Err(error) => {
+                tracing::error!(%error, "durable count lookup failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Data temporarily unavailable",
+                );
+            }
+        };
         return Json(Paged {
             items,
             total,
@@ -1482,12 +1699,30 @@ pub async fn admin_audit_logs(
     if let Some(persistence) = &state.persistence {
         let limit = query.limit.unwrap_or(25).clamp(1, 100);
         let page = query.page.unwrap_or(1).clamp(1, 10_000);
-        let items = persistence
-            .audits(start, page - 1, limit)
-            .await
-            .unwrap_or_default();
+        let items = match persistence.audits(start, page - 1, limit).await {
+            Ok(items) => items,
+            Err(error) => {
+                tracing::error!(%error, "durable audits lookup failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Data temporarily unavailable",
+                );
+            }
+        };
+        // Total must come from the database, not the page size: previously
+        // it was `items.len()`, so pagination always reported one page.
+        let total = match persistence.count_since("audit", start).await {
+            Ok(count) => count.max(0) as usize,
+            Err(error) => {
+                tracing::error!(%error, "durable audit count lookup failed");
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Data temporarily unavailable",
+                );
+            }
+        };
         return Json(Paged {
-            total: items.len(),
+            total,
             items,
             page,
             limit,
@@ -1616,10 +1851,9 @@ pub async fn gateway_guard(
     let route = request.uri().path().to_string();
     let method = request.method().as_str().to_string();
     let headers = request.headers().clone();
-    let ip = security::client_ip(&headers);
-    let device = security::device(&headers);
-    let fingerprint = security::device_fingerprint(&headers);
-    let model = security::device_model(&headers);
+    // Verify the gateway secret *before* trusting any client-supplied
+    // header for logging or rate limiting: previously the (spoofable) IP
+    // was read first and logged even for rejected direct-origin requests.
     if let Some(secret) = &state.config.gateway_secret {
         let supplied = request
             .headers()
@@ -1631,10 +1865,10 @@ pub async fn gateway_guard(
             record_spam(
                 &state,
                 &headers,
-                &ip,
-                &fingerprint,
-                &model,
-                &device,
+                "unknown",
+                &security::device_fingerprint(&headers),
+                &security::device_model(&headers),
+                &security::device(&headers),
                 &route,
                 &method,
                 404,
@@ -1643,20 +1877,52 @@ pub async fn gateway_guard(
             return response;
         }
     }
+    let ip = security::client_ip(&headers);
+    // Global throttle (300/min per IP) for every non-health request.
+    // Login had its own limiter; everything else was unthrottled, and the
+    // spam-logging path itself did database work per request.
+    match state.global_limiter.is_throttled(&ip).await {
+        Ok(true) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many requests. Try again later.",
+            )
+                .into_response();
+        }
+        Ok(false) => {
+            if let Err(error) = state.global_limiter.record_failure(&ip).await {
+                tracing::error!(%error, "global rate limiter record failed");
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, "global rate limiter check failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service temporarily unavailable",
+            )
+                .into_response();
+        }
+    }
     let response = next.run(request).await;
     let status = response.status().as_u16();
-    record_spam(
-        &state,
-        &headers,
-        &ip,
-        &fingerprint,
-        &model,
-        &device,
-        &route,
-        &method,
-        status,
-    )
-    .await;
+    // Only suspicious/failed requests are spam-logged. Previously *every*
+    // request — including every successful page load — did a database
+    // insert plus two session/user lookups, which amplified any flood
+    // into database pressure with a 4-connection pool.
+    if status >= 400 {
+        record_spam(
+            &state,
+            &headers,
+            &ip,
+            &security::device_fingerprint(&headers),
+            &security::device_model(&headers),
+            &security::device(&headers),
+            &route,
+            &method,
+            status,
+        )
+        .await;
+    }
     response
 }
 
@@ -1672,28 +1938,10 @@ async fn record_spam(
     method: &str,
     status: u16,
 ) {
-    let username = if let Some(persistence) = &state.persistence {
-        let resolved = if let Some(token) = security::cookie_value(headers, "vvc_session") {
-            match persistence.session(&token).await {
-                Ok(Some((user_id, _, _, _, _))) => match persistence.user_by_id(&user_id).await {
-                    Ok(Some(user)) => Some(user.username),
-                    Ok(None) => None,
-                    Err(error) => {
-                        tracing::error!(%error, "durable spam username lookup failed");
-                        None
-                    }
-                },
-                Ok(None) => None,
-                Err(error) => {
-                    tracing::error!(%error, "durable spam session lookup failed");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        resolved.unwrap_or_else(|| "anonymous".into())
-    } else {
+    // Resolve the username from the in-memory session map only. Login
+    // populates it in both durable and process-local modes, so this avoids
+    // two extra database queries (session + user) on every logged request.
+    let username = {
         let db = state.pub_store.read().await;
         security::cookie_value(headers, "vvc_session")
             .and_then(|token| db.sessions.get(&token))
@@ -1746,16 +1994,30 @@ pub async fn security_headers(request: Request<axum::body::Body>, next: Next) ->
     let mut response = next.run(request).await;
     let is_404_page = response.status() == StatusCode::NOT_FOUND;
     let headers = response.headers_mut();
-    let csp = if is_admin_page || is_login_page || is_dynamic_page || is_404_page {
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'"
+    // Built-in pages now use only external scripts/styles (the inline
+    // fallbacks were removed), so they get a strict CSP with no
+    // 'unsafe-inline'. User-uploaded dynamic pages may legitimately use
+    // inline code, so they keep 'unsafe-inline' — but still get
+    // frame-ancestors/object-src protection.
+    let csp = if is_dynamic_page || is_404_page {
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; form-action 'self'"
     } else {
-        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'"
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; form-action 'self'"
     };
+    let _ = is_admin_page;
+    let _ = is_login_page;
     headers.insert("content-security-policy", HeaderValue::from_static(csp));
     headers.insert(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
+    // HSTS: browsers ignore it over plain HTTP, so it is safe to send on
+    // local dev too; in production all traffic is HTTPS.
+    headers.insert(
+        "strict-transport-security",
+        HeaderValue::from_static("max-age=63072000; includeSubDomains; preload"),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     headers.insert(
         "permissions-policy",
@@ -1795,9 +2057,7 @@ async fn auth_context(state: &AppState, headers: &HeaderMap) -> Option<AuthConte
         let csrf_token = security::cookie_value(headers, "vvc_csrf").filter(|value| {
             security::constant_time_equal(&security::hash_session_token(value), &csrf_hash)
         });
-        let Some(csrf_token) = csrf_token else {
-            return None;
-        };
+        let csrf_token = csrf_token?;
         if user.blocked {
             let _ = persistence.revoke_session(&token).await;
             return None;
@@ -1987,12 +2247,11 @@ fn delegated_permissions(actor: &User, role: &Role) -> HashSet<String> {
             .collect();
     }
     let actor_permissions = store::permissions_for(actor);
+    // Delegation can never grant more than the role itself holds — and
+    // since Admin no longer holds destructive permissions, an Admin
+    // cannot delegate them to a new account either.
     let allowed: HashSet<String> = match role {
-        Role::Admin => store::ALL_PERMISSIONS
-            .iter()
-            .filter(|p| **p != "admin.audit_logs.read")
-            .map(|s| (*s).to_string())
-            .collect(),
+        Role::Admin => store::permissions_for_role(&Role::Admin),
         Role::User => ["home.read", "about.read"]
             .iter()
             .map(|s| (*s).to_string())
