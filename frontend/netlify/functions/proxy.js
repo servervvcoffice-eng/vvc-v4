@@ -46,6 +46,10 @@ exports.handler = async (event) => {
       'x-forwarded-for',
       'x-forwarded-host',
       'x-forwarded-proto',
+      // Never forward a client-supplied IP header (see the Cloudflare
+      // Worker): it would let the caller pick the rate-limited IP.
+      'cf-connecting-ip',
+      'x-real-ip',
     ].includes(lower)) {
       headers.set(name, value);
     }
